@@ -35,6 +35,7 @@
   <xacro:arg name="trajectory_port" default="50003"/>
   <xacro:arg name="verify_robot_model" default="true" />
   <xacro:arg name="use_currents_as_efforts" default="true"/>
+  <xacro:arg name="amp_stop_recovery_handling" default="false"/>
 
   <xacro:arg name="blocking_read" default="false" />
 
@@ -113,6 +114,7 @@
     ur_type="$(arg ur_type)"
     verify_robot_model="$(arg verify_robot_model)"
     use_currents_as_efforts="$(arg use_currents_as_efforts)"
+    amp_stop_recovery_handling="$(arg amp_stop_recovery_handling)"
     non_blocking_read="${not blocking_read}"
   />
 

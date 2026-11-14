@@ -63,6 +63,8 @@
 #include "ur_client_library/ur/robot_receive_timeout.h"
 #include "ur_robot_driver/dashboard_client_ros.hpp"
 #include "ur_dashboard_msgs/msg/robot_mode.hpp"
+#include "ur_client_library/ur/dashboard_client.h"
+#include "ur_client_library/ur/datatypes.h"
 
 // ROS
 #include "rclcpp/macros.hpp"
@@ -186,6 +188,17 @@ protected:
 
   // stop function used by on_shutdown and on_cleanup
   hardware_interface::CallbackReturn stop();
+
+  // True when the robot will execute a command this cycle: program running, runtime PLAYING, safety_mode
+  // normal or reduced. Only consulted when amp_stop_recovery_handling_ is set.
+  bool isCommandable() const;
+  // Unlocks a protective stop or restarts safety, resends the control program, and waits for isCommandable().
+  // Refuses (returns false) on an e-stop, on local control, or if the robot never becomes commandable.
+  bool recoverFromStop();
+  // True once recovery_dashboard_client_ exists. Does not itself (re)connect.
+  bool ensureRecoveryDashboard();
+  // Low-rate dashboard query for local/remote control, called from the async thread; RTDE has no field for it.
+  void pollLocalControl();
 
   // The driver keeps working on its member variables. Each exported interface handle is paired with the member that
   // holds its value, and both are synchronized at fixed points:
@@ -490,6 +503,27 @@ protected:
   bool use_currents_as_efforts_ = true;
 
   urcl::ControlBoxType control_box_type_ = urcl::ControlBoxType::UNKNOWN;
+
+  // Opt-in AMP hardware-contract behaviour: write() -> DEACTIVATE on an uncommandable stop, read() -> ERROR
+  // on an RTDE loss, on_activate recovery, and the initialize/request and gpio/local_control interfaces.
+  // Off by default, so upstream behaviour (controller_stopper, robot_state_helper) is unchanged.
+  bool amp_stop_recovery_handling_{ false };
+
+  // Dashboard connection used only for recovery and the local-control poll. Independent of RTDE, so it
+  // survives the loss read() reports, and of the reverse interface, so on_activate can use it before the
+  // control program reconnects.
+  std::unique_ptr<urcl::DashboardClient> recovery_dashboard_client_;
+
+  // initialize/request (command), initialize/done (state): power the arm on and release the brakes
+  // (contract section 4.4). Handled asynchronously in checkAsyncIO, like the other async commands.
+  double initialize_request_cmd_;
+  double initialize_done_;
+
+  // Local/remote control (state only), 1.0 local / 0.0 remote. Filled by pollLocalControl from the async
+  // thread; local_control_ is the value read() publishes, synchronized from the atomic once per cycle.
+  std::atomic<bool> local_control_atomic_{ false };
+  double local_control_;
+  int local_control_poll_counter_{ 0 };
 };
 }  // namespace ur_robot_driver
 

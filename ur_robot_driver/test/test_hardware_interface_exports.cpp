@@ -54,11 +54,14 @@
 constexpr size_t kJointCount = 6;
 constexpr const char* kTfPrefix = "";
 
-hardware_interface::HardwareInfo BuildTestHardwareInfo()
+hardware_interface::HardwareInfo BuildTestHardwareInfo(bool amp_stop_recovery_handling = false)
 {
   hardware_interface::HardwareInfo info;
   info.type = "system";
   info.hardware_parameters["tf_prefix"] = kTfPrefix;
+  if (amp_stop_recovery_handling) {
+    info.hardware_parameters["amp_stop_recovery_handling"] = "true";
+  }
 
   auto make_interface = [](const std::string& name) {
     hardware_interface::InterfaceInfo iface{};
@@ -157,7 +160,14 @@ hardware_interface::HardwareInfo BuildTestHardwareInfo()
     gpio_states.push_back("safety_status_bit_" + std::to_string(i));
   }
   gpio_states.push_back("program_running");
+  if (amp_stop_recovery_handling) {
+    gpio_states.push_back("local_control");
+  }
   make_gpio("gpio", gpio_cmds, gpio_states);
+
+  if (amp_stop_recovery_handling) {
+    make_gpio("initialize", { "request" }, { "done" });
+  }
 
   make_gpio("payload",
             { "mass", "cog.x", "cog.y", "cog.z", "inertia.ixx", "inertia.iyy", "inertia.izz", "inertia.ixy",
@@ -491,6 +501,48 @@ TEST(URHardwareInterfaceExport, SupportsDescriptionsWithoutEffortCommands)
     EXPECT_THAT(exported_names, ::testing::Not(::testing::Contains("joint_" + std::to_string(i) + "/" +
                                                                    hardware_interface::HW_IF_EFFORT)));
   }
+}
+
+// amp_stop_recovery_handling is opt-in: with the description declaring gpio/local_control and the
+// initialize gpio (as ur.ros2_control.xacro does when the parameter is set), initialization succeeds and
+// both are exported.
+TEST(URHardwareInterfaceExport, ExportsAmpStopRecoveryInterfacesWhenEnabled)
+{
+  hardware_interface::HardwareComponentParams params;
+  params.hardware_info = BuildTestHardwareInfo(/*amp_stop_recovery_handling=*/true);
+  params.clock = std::make_shared<rclcpp::Clock>();
+  params.logger = rclcpp::get_logger("test_ur_hardware_interface_amp_stop_recovery");
+
+  hardware_interface::System hardware(std::make_unique<ur_robot_driver::URPositionHardwareInterface>());
+  const auto state = hardware.initialize(params);
+  ASSERT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+
+  const auto state_names = GetNames(hardware.export_state_interfaces());
+  const auto command_names = GetNames(hardware.export_command_interfaces());
+
+  EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "gpio/local_control"));
+  EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "initialize/done"));
+  EXPECT_THAT(command_names, ::testing::Contains(std::string(kTfPrefix) + "initialize/request"));
+}
+
+// The discriminating case: the hardware parameter is set but the description was not updated to match (a
+// xacro/parameter drift). on_export_state_interfaces() must fail loudly (add_state_mirror's
+// get_state_interface_handle throws on an interface the description never declared) rather than silently
+// running with the feature half-off; fails pre-fix, since on_init never read the parameter and there was no
+// gated add_state_mirror call to throw.
+TEST(URHardwareInterfaceExport, RefusesWhenAmpStopRecoveryInterfacesAreMissing)
+{
+  hardware_interface::HardwareComponentParams params;
+  params.hardware_info = BuildTestHardwareInfo(/*amp_stop_recovery_handling=*/false);
+  params.hardware_info.hardware_parameters["amp_stop_recovery_handling"] = "true";
+  params.clock = std::make_shared<rclcpp::Clock>();
+  params.logger = rclcpp::get_logger("test_ur_hardware_interface_amp_stop_recovery_missing_interfaces");
+
+  hardware_interface::System hardware(std::make_unique<ur_robot_driver::URPositionHardwareInterface>());
+  const auto state = hardware.initialize(params);
+  ASSERT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+
+  EXPECT_THROW(hardware.export_state_interfaces(), std::exception);
 }
 
 int main(int argc, char** argv)

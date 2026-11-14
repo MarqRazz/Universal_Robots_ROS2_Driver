@@ -30,9 +30,13 @@
     rw_rate:=0
     verify_robot_model:=true
     use_currents_as_efforts:=true
+    amp_stop_recovery_handling:=false
     ">
     <!-- tool_voltage_t2 uses single quotes because this params attribute is double-quoted. An empty value means do not set a startup voltage. -->
     <!-- rw_rate of 0 uses the rate of the controller_manager -->
+    <!-- amp_stop_recovery_handling is opt-in: write() -> DEACTIVATE on a stop, read() -> ERROR on an RTDE
+         loss, on_activate recovery, and the initialize/request and gpio/local_control interfaces below.
+         Off, the driver behaves exactly as it does without this parameter. -->
 
     <xacro:property name="config_kinematics_parameters" value="${xacro.load_yaml(kinematics_parameters_file)}"/>
     <xacro:property name="sec_kinematics" value="${config_kinematics_parameters['kinematics']}" />
@@ -84,6 +88,7 @@
           <param name="robot_receive_timeout">${robot_receive_timeout}</param>
           <param name="verify_robot_model">${verify_robot_model}</param>
           <param name="use_currents_as_efforts">${use_currents_as_efforts}</param>
+          <param name="amp_stop_recovery_handling">${amp_stop_recovery_handling}</param>
         </xacro:unless>
       </hardware>
 
@@ -246,7 +251,20 @@
             <param name="initial_value">1</param>
           </xacro:if>
         </state_interface>
+
+        <!-- RTDE has no field for this; the driver polls the dashboard at a low rate instead. -->
+        <xacro:if value="${amp_stop_recovery_handling}">
+          <state_interface name="local_control"/>
+        </xacro:if>
       </gpio>
+
+      <!-- Power the arm on and release the brakes; on_activate only does the remotely clearable recovery. -->
+      <xacro:if value="${amp_stop_recovery_handling}">
+        <gpio name="${tf_prefix}initialize">
+          <command_interface name="request"/>
+          <state_interface name="done"/>
+        </gpio>
+      </xacro:if>
 
       <gpio name="${tf_prefix}payload">
         <command_interface name="mass"/>

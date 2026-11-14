@@ -127,6 +127,15 @@ URPositionHardwareInterface::on_init(const hardware_interface::HardwareComponent
 
   info_ = params.hardware_info;
 
+  // Read here, not in on_configure: on_export_state_interfaces/on_export_command_interfaces run right after
+  // on_init and need to know whether to export the gated interfaces below.
+  const auto stop_recovery_it = info_.hardware_parameters.find("amp_stop_recovery_handling");
+  amp_stop_recovery_handling_ = stop_recovery_it != info_.hardware_parameters.end() &&
+                                (stop_recovery_it->second == "true" || stop_recovery_it->second == "True");
+  initialize_request_cmd_ = NO_NEW_CMD_;
+  initialize_done_ = 0.0;
+  local_control_ = 0.0;
+
   // initialize
   urcl_joint_positions_ = { { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 } };
   urcl_joint_velocities_ = { { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 } };
@@ -194,6 +203,10 @@ URPositionHardwareInterface::on_init(const hardware_interface::HardwareComponent
   tool_output_voltage_copy_ = 0.0;
   robot_mode_copy_ = 0.0;
   safety_mode_copy_ = 0.0;
+  // read() has not run yet at on_activate, so recoverFromStop's gating needs a safe starting value rather
+  // than whatever was on the heap: DISCONNECTED is not RUNNING, so NOT_INITIALIZED correctly refuses first.
+  robot_mode_ = static_cast<int32_t>(urcl::RobotMode::DISCONNECTED);
+  safety_mode_ = static_cast<int32_t>(urcl::SafetyMode::UNDEFINED_SAFETY_MODE);
   tool_mode_copy_ = 0.0;
   tool_output_current_ = 0.0;
   tool_temperature_ = 0.0;
@@ -421,6 +434,13 @@ URPositionHardwareInterface::on_export_state_interfaces()
   add_state_mirror(tf_prefix + HW_IF_MOTION_PRIMITIVES, "execution_status", &hw_moprim_states_[0]);
   add_state_mirror(tf_prefix + HW_IF_MOTION_PRIMITIVES, "ready_for_new_primitive", &hw_moprim_states_[1]);
 
+  // Declared in the description only when amp_stop_recovery_handling is set (see ur.ros2_control.xacro),
+  // so these mirrors are added to match; add_state_mirror would otherwise throw on an undeclared interface.
+  if (amp_stop_recovery_handling_) {
+    add_state_mirror(tf_prefix + "initialize", "done", &initialize_done_);
+    add_state_mirror(tf_prefix + "gpio", "local_control", &local_control_);
+  }
+
   return exported_interfaces;
 }
 
@@ -618,6 +638,10 @@ std::vector<hardware_interface::CommandInterface::SharedPtr> URPositionHardwareI
   });
 
   freedrive_mode_abort_handle_ = get_command_interface_handle(tf_prefix + FREEDRIVE_MODE_GPIO + "/abort");
+
+  if (amp_stop_recovery_handling_) {
+    add_async_command_mirror(tf_prefix + "initialize", "request", &initialize_request_cmd_);
+  }
 
   return exported_interfaces;
 }
@@ -935,6 +959,20 @@ URPositionHardwareInterface::on_configure(const rclcpp_lifecycle::State& previou
   get_robot_software_version_build_ = version_info_.build;
   get_robot_software_version_bugfix_ = version_info_.bugfix;
 
+  if (amp_stop_recovery_handling_) {
+    // Independent of the RTDE/reverse-interface connection above, so on_activate can unlock a protective
+    // stop and resend the program before the control program reconnects.
+    const auto client_policy = version_info_.major >= 10 ? urcl::DashboardClient::ClientPolicy::POLYSCOPE_X :
+                                                           urcl::DashboardClient::ClientPolicy::G5;
+    recovery_dashboard_client_ = std::make_unique<urcl::DashboardClient>(robot_ip, client_policy);
+    if (!recovery_dashboard_client_->connect(3, std::chrono::seconds(2))) {
+      RCLCPP_ERROR(rclcpp::get_logger("URPositionHardwareInterface"),
+                   "amp_stop_recovery_handling is set, but connecting to the dashboard server at '%s' failed. "
+                   "on_activate will refuse to recover a stop until this is fixed.",
+                   robot_ip.c_str());
+    }
+  }
+
   auto robot_type = ur_driver_->getPrimaryClient()->getRobotType();
   auto robot_series = ur_driver_->getPrimaryClient()->getRobotSeries();
 
@@ -1013,7 +1051,100 @@ URPositionHardwareInterface::on_activate(const rclcpp_lifecycle::State& previous
 {
   RCLCPP_INFO(rclcpp::get_logger("URPositionHardwareInterface"), "Activating HW interface");
 
-  return hardware_interface::CallbackReturn::SUCCESS;
+  if (!amp_stop_recovery_handling_) {
+    return hardware_interface::CallbackReturn::SUCCESS;
+  }
+
+  return recoverFromStop() ? hardware_interface::CallbackReturn::SUCCESS : hardware_interface::CallbackReturn::ERROR;
+}
+
+bool URPositionHardwareInterface::isCommandable() const
+{
+  return runtime_state_ == static_cast<uint32_t>(rtde::RUNTIME_STATE::PLAYING) && robot_program_running_ &&
+         (safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::NORMAL) ||
+          safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::REDUCED));
+}
+
+bool URPositionHardwareInterface::ensureRecoveryDashboard()
+{
+  return amp_stop_recovery_handling_ && recovery_dashboard_client_ != nullptr;
+}
+
+bool URPositionHardwareInterface::recoverFromStop()
+{
+  const auto* logger_name = "URPositionHardwareInterface";
+  // safety_mode_ and robot_mode_ are plain members read() writes on the RT thread, same as robot_mode_ already
+  // was; on_activate runs after at least one read(), so a stale value here means read() is already reporting
+  // ERROR, not this function.
+  //
+  // robot_mode_ not RUNNING (powered off, brakes on) is NOT_INITIALIZED: a released e-stop leaves the robot
+  // here, and only initialize/request clears it, because power-on and brake release move the arm and
+  // on_activate must not.
+  if (robot_mode_ != static_cast<int32_t>(urcl::RobotMode::RUNNING)) {
+    RCLCPP_ERROR(rclcpp::get_logger(logger_name),
+                 "Cannot activate: robot_mode %d is not RUNNING. Use the initialize/request interface first.",
+                 robot_mode_);
+    return false;
+  }
+  if (safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::ROBOT_EMERGENCY_STOP) ||
+      safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::SYSTEM_EMERGENCY_STOP)) {
+    RCLCPP_ERROR(rclcpp::get_logger(logger_name),
+                 "Cannot activate: an e-stop is active (safety_mode %d). Release it at the robot.", safety_mode_);
+    return false;
+  }
+  if (local_control_atomic_) {
+    RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: the robot is in local control.");
+    return false;
+  }
+  if (!ensureRecoveryDashboard()) {
+    RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: the recovery dashboard connection is unavailable.");
+    return false;
+  }
+
+  // Unlock a protective stop (refused for 5 s after it trips, so retry) or restart safety on a fault or
+  // violation; an e-stop is refused above instead, since it is not clearable this way.
+  const auto safety_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!(safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::NORMAL) ||
+           safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::REDUCED))) {
+    if (safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::PROTECTIVE_STOP)) {
+      recovery_dashboard_client_->commandUnlockProtectiveStop();
+    } else if (safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::FAULT) ||
+               safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::VIOLATION)) {
+      recovery_dashboard_client_->commandRestartSafety();
+    } else {
+      // safety_mode moved to something neither call clears, e.g. an e-stop appeared mid-recovery.
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: safety_mode %d needs an operator at the robot.",
+                   safety_mode_);
+      return false;
+    }
+    if (std::chrono::steady_clock::now() > safety_deadline) {
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: safety_mode %d did not clear within 10 s.",
+                   safety_mode_);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+
+  if (ur_driver_) {
+    try {
+      ur_driver_->sendRobotProgram();
+    } catch (const urcl::UrException& e) {
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Resending the control program failed: %s", e.what());
+    }
+  }
+
+  const auto program_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!isCommandable()) {
+    if (std::chrono::steady_clock::now() > program_deadline) {
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name),
+                   "Cannot activate: the control program did not reach PLAYING within 5 s (runtime_state %u, "
+                   "program_running %d, safety_mode %d).",
+                   runtime_state_, robot_program_running_.load(), safety_mode_);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  return true;
 }
 
 hardware_interface::CallbackReturn
@@ -1051,6 +1182,11 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::stop()
 
   instruction_executor_.reset();
   ur_driver_.reset();
+
+  if (recovery_dashboard_client_) {
+    recovery_dashboard_client_->disconnect();
+    recovery_dashboard_client_.reset();
+  }
 
   RCLCPP_INFO(rclcpp::get_logger("URPositionHardwareInterface"), "System successfully stopped!");
 
@@ -1209,7 +1345,11 @@ hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::
     RCLCPP_ERROR(rclcpp::get_logger("URPositionHardwareInterface"), "Unable to read from hardware...");
   // States can also change outside of read(), e.g. in write() or in callbacks.
   push_state_mirrors();
-  // TODO(anyone): could not read from the driver --> return ERROR --> on error will be called
+  // A blocking read that returned nothing is an RTDE loss; non_blocking_read_ has no such signal, since an
+  // empty poll is the normal case there.
+  if (amp_stop_recovery_handling_ && !non_blocking_read_) {
+    return hardware_interface::return_type::ERROR;
+  }
   return hardware_interface::return_type::OK;
 }
 
@@ -1227,6 +1367,14 @@ hardware_interface::return_type URPositionHardwareInterface::write(const rclcpp:
       passthrough_trajectory_abort_ = 0.0;
     }
     passthrough_trajectory_transfer_state_ = 5.0;
+  }
+
+  // amp_stop_recovery_handling_ replaces this cycle's silent no-op with DEACTIVATE: the component leaves
+  // ACTIVE instead of quietly pausing, so a stop always goes through on_activate's recovery rather than the
+  // robot resuming whatever it was doing on its own (the motion rule the stock driver leaves unenforced).
+  if (amp_stop_recovery_handling_ && !isCommandable()) {
+    push_command_mirrors(command_mirrors_, false);
+    return hardware_interface::return_type::DEACTIVATE;
   }
 
   // If there is no interpreting program running on the robot, we do not want to send anything.
@@ -1556,7 +1704,37 @@ void URPositionHardwareInterface::checkAsyncIO()
     freedrive_mode_abort_ = NO_NEW_CMD_;
   }
 
+  if (amp_stop_recovery_handling_) {
+    if (!std::isnan(initialize_request_cmd_)) {
+      if (ensureRecoveryDashboard()) {
+        // Blocking dashboard calls; fine here, this thread is not real-time (see the comment above).
+        recovery_dashboard_client_->commandPowerOn();
+        recovery_dashboard_client_->commandBrakeRelease();
+      }
+      initialize_request_cmd_ = NO_NEW_CMD_;
+    }
+    pollLocalControl();
+  }
+
   push_command_mirrors(async_command_mirrors_, true);
+}
+
+void URPositionHardwareInterface::pollLocalControl()
+{
+  // Every ~2 s (asyncThread calls checkAsyncIO every 20 ms): RTDE has no local/remote field, and polling the
+  // dashboard on every cycle would needlessly load its single TCP connection.
+  if (++local_control_poll_counter_ < 100) {
+    return;
+  }
+  local_control_poll_counter_ = 0;
+  if (!ensureRecoveryDashboard()) {
+    return;
+  }
+  try {
+    local_control_atomic_ = !recovery_dashboard_client_->commandIsInRemoteControl();
+  } catch (const urcl::UrException&) {
+    // CB3 robots do not support the query; leave the last known value.
+  }
 }
 
 void URPositionHardwareInterface::check_tool_contact_controller()
@@ -1611,6 +1789,10 @@ void URPositionHardwareInterface::updateNonDoubleValues()
   tool_mode_copy_ = static_cast<double>(tool_mode_);
   system_interface_initialized_ = initialized_ ? 1.0 : 0.0;
   robot_program_running_copy_ = robot_program_running_ ? 1.0 : 0.0;
+  if (amp_stop_recovery_handling_) {
+    initialize_done_ = robot_mode_ == static_cast<int32_t>(urcl::RobotMode::RUNNING) ? 1.0 : 0.0;
+    local_control_ = local_control_atomic_ ? 1.0 : 0.0;
+  }
 }
 
 void URPositionHardwareInterface::transformForceTorque()
