@@ -190,7 +190,7 @@ protected:
   hardware_interface::CallbackReturn stop();
 
   // True when the robot will execute a command this cycle: program running, runtime PLAYING, safety_mode
-  // normal or reduced. Only consulted when amp_stop_recovery_handling_ is set.
+  // normal or reduced. Only consulted when stop_recovery_handling_ is set.
   bool isCommandable() const;
   // Unlocks a protective stop or restarts safety, resends the control program, and waits for isCommandable().
   // Refuses (returns false) on an e-stop, on local control, or if the robot never becomes commandable.
@@ -504,10 +504,10 @@ protected:
 
   urcl::ControlBoxType control_box_type_ = urcl::ControlBoxType::UNKNOWN;
 
-  // Opt-in AMP hardware-contract behaviour: write() -> DEACTIVATE on an uncommandable stop, read() -> ERROR
+  // Opt-in hardware-contract behaviour: write() -> DEACTIVATE on an uncommandable stop, read() -> ERROR
   // on an RTDE loss, on_activate recovery, and the initialize/request and gpio/local_control interfaces.
   // Off by default, so upstream behaviour (controller_stopper, robot_state_helper) is unchanged.
-  bool amp_stop_recovery_handling_{ false };
+  bool stop_recovery_handling_{ false };
 
   // Dashboard connection used only for recovery and the local-control poll. Independent of RTDE, so it
   // survives the loss read() reports, and of the reverse interface, so on_activate can use it before the
