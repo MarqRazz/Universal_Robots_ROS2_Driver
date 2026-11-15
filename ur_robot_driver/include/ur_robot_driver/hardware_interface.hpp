@@ -269,6 +269,10 @@ protected:
   Quaternion tcp_rotation_buffer;
 
   bool packet_read_;
+  // Set once read() has processed its first RTDE packet. on_activate can run before the control loop's
+  // first read() (confirmed live: the very first activation attempt after on_configure races ahead of RTDE),
+  // so recoverFromStop() waits on this before trusting robot_mode_/safety_mode_.
+  std::atomic_bool first_packet_received_{ false };
 
   uint32_t runtime_state_;
   bool controllers_initialized_;

@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "hardware_interface/system.hpp"
+#include "hardware_interface/types/hardware_component_interface_params.hpp"
 #include "hardware_interface/types/hardware_component_params.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "ur_robot_driver/hardware_interface.hpp"
@@ -543,6 +544,24 @@ TEST(URHardwareInterfaceExport, RefusesWhenStopRecoveryInterfacesAreMissing)
   ASSERT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
 
   EXPECT_THROW(hardware.export_state_interfaces(), std::exception);
+}
+
+// A refused on_activate (here: no RTDE data ever arrives, since on_configure was never called) must return
+// FAILURE, not ERROR: FAILURE leaves the component at INACTIVE so a later recover can retry it (C32); ERROR
+// routes through on_error(), which this class does not override, leaving it at UNCONFIGURED instead (fails
+// pre-fix: returned ERROR).
+TEST(URHardwareInterfaceExport, ActivateReturnsFailureNotErrorWhenRefused)
+{
+  ur_robot_driver::URPositionHardwareInterface hw;
+  hardware_interface::HardwareComponentInterfaceParams params;
+  params.hardware_info = BuildTestHardwareInfo(/*stop_recovery_handling=*/true);
+
+  ASSERT_EQ(hw.on_init(params), hardware_interface::CallbackReturn::SUCCESS);
+
+  const auto result = hw.on_activate(rclcpp_lifecycle::State());
+
+  EXPECT_EQ(result, hardware_interface::CallbackReturn::FAILURE);
+  EXPECT_NE(result, hardware_interface::CallbackReturn::ERROR);
 }
 
 int main(int argc, char** argv)

@@ -899,6 +899,7 @@ URPositionHardwareInterface::on_configure(const rclcpp_lifecycle::State& previou
     }
 
     rtde_comm_has_been_started_ = false;
+    first_packet_received_ = false;
     urcl::UrDriverConfiguration driver_config;
     driver_config.robot_ip = robot_ip;
     driver_config.script_file = script_filename;
@@ -1055,7 +1056,13 @@ URPositionHardwareInterface::on_activate(const rclcpp_lifecycle::State& previous
     return hardware_interface::CallbackReturn::SUCCESS;
   }
 
-  return recoverFromStop() ? hardware_interface::CallbackReturn::SUCCESS : hardware_interface::CallbackReturn::ERROR;
+  // FAILURE, not ERROR: a refused activation leaves the component at INACTIVE so a later recover can
+  // retry (hardware_component.cpp's activate()); ERROR routes through on_error(), which this class does not
+  // override, so the default on_error leaves the component at UNCONFIGURED without running stop() -- the RTDE
+  // connection and its input recipe are never released, and the next on_configure's reconnect collides with
+  // the still-open one (confirmed live against URSim: "speed_slider_mask is currently controlled by another
+  // RTDE client").
+  return recoverFromStop() ? hardware_interface::CallbackReturn::SUCCESS : hardware_interface::CallbackReturn::FAILURE;
 }
 
 bool URPositionHardwareInterface::isCommandable() const
@@ -1073,10 +1080,21 @@ bool URPositionHardwareInterface::ensureRecoveryDashboard()
 bool URPositionHardwareInterface::recoverFromStop()
 {
   const auto* logger_name = "URPositionHardwareInterface";
-  // safety_mode_ and robot_mode_ are plain members read() writes on the RT thread, same as robot_mode_ already
-  // was; on_activate runs after at least one read(), so a stale value here means read() is already reporting
-  // ERROR, not this function.
-  //
+
+  // ros2_control_node's own startup can call on_activate before the control loop's first read(), so
+  // robot_mode_/safety_mode_ may still hold on_configure's pre-read defaults rather than the robot's actual
+  // state. Wait for read() to have processed at least one RTDE packet; bounded, since a connection that never
+  // delivers one is itself a reason to refuse.
+  const auto packet_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!first_packet_received_) {
+    if (std::chrono::steady_clock::now() > packet_deadline) {
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name),
+                   "Cannot activate: no RTDE data received within 3 s; cannot read robot_mode or safety_mode.");
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
   // robot_mode_ not RUNNING (powered off, brakes on) is NOT_INITIALIZED: a released e-stop leaves the robot
   // here, and only initialize/request clears it, because power-on and brake release move the arm and
   // on_activate must not.
@@ -1269,6 +1287,7 @@ hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::
     readData(data_package_buffer_, "tool_temperature", tool_temperature_);
     readData(data_package_buffer_, "robot_mode", robot_mode_);
     readData(data_package_buffer_, "safety_mode", safety_mode_);
+    first_packet_received_ = true;
     readBitsetData<uint32_t>(data_package_buffer_, "robot_status_bits", robot_status_bits_);
     readBitsetData<uint32_t>(data_package_buffer_, "safety_status_bits", safety_status_bits_);
     readBitsetData<uint64_t>(data_package_buffer_, "actual_digital_input_bits", actual_dig_in_bits_);
