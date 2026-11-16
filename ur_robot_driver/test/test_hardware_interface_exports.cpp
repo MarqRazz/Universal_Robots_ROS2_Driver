@@ -556,6 +556,57 @@ TEST(URHardwareInterfaceExport, ActivateReturnsErrorWhenRobotStateIsUnreachable)
   EXPECT_EQ(result, hardware_interface::CallbackReturn::ERROR);
 }
 
+// Exposes the protected gate under test; adds nothing else.
+class TestableHardwareInterface : public ur_robot_driver::URPositionHardwareInterface
+{
+public:
+  using ur_robot_driver::URPositionHardwareInterface::ConfirmsProgramRestart;
+};
+
+// recoverFromStop() resends the program unconditionally, then (pre-fix) checked isCommandable()
+// against whatever runtime_state_/robot_program_running_ already held from before the resend - the
+// old program's, if one was already marked running. That let on_activate exit immediately, before
+// the new program had actually started, which is the root cause of 8117262's sub-millisecond "warm"
+// activations and the write()-driven DEACTIVATE moments later. ConfirmsProgramRestart requires
+// either that no program was running before the resend, or that the program has been observed to
+// stop since, before a later "commandable" counts. Fails pre-fix: 8117262 had no such gate, so
+// recoverFromStop() accepted isCommandable() == true on the very first pulled packet after
+// sendRobotProgram() even though that packet still described the old program (robot_program_running_
+// true throughout, never seen to drop).
+TEST(URHardwareInterfaceExport, ConfirmsProgramRestartRejectsStaleRunningState)
+{
+  bool seen_program_stop = false;
+
+  // Old program was running, resend happens, but the first fresh packet still shows the old
+  // program's state (nothing ever dropped) - must not count as the new program.
+  EXPECT_FALSE(TestableHardwareInterface::ConfirmsProgramRestart(
+      /*program_was_running_before_resend=*/true, /*program_running_now=*/true,
+      /*commandable_now=*/true, seen_program_stop));
+  EXPECT_FALSE(seen_program_stop);
+
+  // The old program is observed to actually stop.
+  EXPECT_FALSE(TestableHardwareInterface::ConfirmsProgramRestart(
+      /*program_was_running_before_resend=*/true, /*program_running_now=*/false,
+      /*commandable_now=*/false, seen_program_stop));
+  EXPECT_TRUE(seen_program_stop);
+
+  // Only now does a later "commandable" count as the new program.
+  EXPECT_TRUE(TestableHardwareInterface::ConfirmsProgramRestart(
+      /*program_was_running_before_resend=*/true, /*program_running_now=*/true,
+      /*commandable_now=*/true, seen_program_stop));
+}
+
+// Nothing was running before the resend, so there is no stale "running" to mistake for the new
+// program - the very first fresh commandable packet counts right away.
+TEST(URHardwareInterfaceExport, ConfirmsProgramRestartAcceptsFirstRunWithNothingRunningBefore)
+{
+  bool seen_program_stop = false;
+
+  EXPECT_TRUE(TestableHardwareInterface::ConfirmsProgramRestart(
+      /*program_was_running_before_resend=*/false, /*program_running_now=*/true,
+      /*commandable_now=*/true, seen_program_stop));
+}
+
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);

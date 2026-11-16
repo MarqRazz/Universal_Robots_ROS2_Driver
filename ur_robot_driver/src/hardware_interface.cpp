@@ -1069,6 +1069,16 @@ bool URPositionHardwareInterface::isCommandable() const
           safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::REDUCED));
 }
 
+bool URPositionHardwareInterface::ConfirmsProgramRestart(bool program_was_running_before_resend,
+                                                         bool program_running_now, bool commandable_now,
+                                                         bool& seen_program_stop)
+{
+  if (!seen_program_stop) {
+    seen_program_stop = program_running_now ? !program_was_running_before_resend : true;
+  }
+  return seen_program_stop && commandable_now;
+}
+
 bool URPositionHardwareInterface::ensureRecoveryDashboard()
 {
   return stop_recovery_handling_ && recovery_dashboard_client_ != nullptr;
@@ -1193,7 +1203,12 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::recoverFromStop(
     }
   }
 
-  if (ur_driver_) {
+  // Already commandable (program running under this same activation, nothing stopped it): resending would
+  // restart a program that didn't need restarting, and the only reason to resend is to make the robot
+  // commandable in the first place.
+  const bool already_commandable = isCommandable();
+  const bool program_was_running_before_resend = robot_program_running_.load();
+  if (!already_commandable && ur_driver_) {
     try {
       ur_driver_->sendRobotProgram();
     } catch (const urcl::UrException& e) {
@@ -1201,7 +1216,21 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::recoverFromStop(
     }
   }
 
-  while (!isCommandable()) {
+  // isCommandable() right after a resend can still read the old program's runtime_state_/robot_program_running_
+  // (both only update on the next pulled packet or driver callback), so a bare isCommandable() here could
+  // accept the program that was just replaced. ConfirmsProgramRestart requires fresh state, pulled after the
+  // resend, and - when a program was already reporting running - requires that program to have been seen to
+  // stop before a later "running" counts as the new one.
+  bool seen_program_stop = already_commandable;
+  while (!already_commandable) {
+    if (!pullRobotState()) {
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: no RTDE data; communication is lost.");
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+    if (ConfirmsProgramRestart(program_was_running_before_resend, robot_program_running_.load(), isCommandable(),
+                               seen_program_stop)) {
+      break;
+    }
     if (timed_out()) {
       const std::string reason = "Cannot activate: the control program did not reach PLAYING (runtime_state " +
                                  std::to_string(runtime_state_) + ", program_running " +
@@ -1212,10 +1241,6 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::recoverFromStop(
       return hardware_interface::CallbackReturn::FAILURE;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (!pullRobotState()) {
-      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: no RTDE data; communication is lost.");
-      return hardware_interface::CallbackReturn::ERROR;
-    }
   }
   // Seeds read()'s outage watchdog from this known-good moment, not on_configure's connect.
   last_rtde_packet_ = std::chrono::steady_clock::now();

@@ -194,6 +194,14 @@ protected:
   // True when the robot will execute a command this cycle: program running, runtime PLAYING, safety_mode
   // normal or reduced. Only consulted when stop_recovery_handling_ is set.
   bool isCommandable() const;
+  // After resending the program, robot_program_running_/runtime_state_ can still read as the old program's
+  // (set before the resend); accepting "commandable" from that stale pair exits before the new program is
+  // actually the one running. Call once per fresh pullRobotState() after sendRobotProgram(): seen_program_stop
+  // starts at !program_was_running_before_resend and latches true the first time program_running_now is
+  // false, so a from-fresh "commandable" only counts once the old program's end has actually been observed
+  // (or there was no old program to confuse it with).
+  static bool ConfirmsProgramRestart(bool program_was_running_before_resend, bool program_running_now,
+                                     bool commandable_now, bool& seen_program_stop);
   // Powers on, releases the brakes, unlocks a protective stop or restarts safety, and resends the control
   // program, re-reading state between each step; FAILURE needs an operator, ERROR is a genuine comms loss.
   hardware_interface::CallbackReturn recoverFromStop();
