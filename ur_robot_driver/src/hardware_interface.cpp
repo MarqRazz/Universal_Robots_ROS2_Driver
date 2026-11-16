@@ -1150,6 +1150,11 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::recoverFromStop(
     return hardware_interface::CallbackReturn::FAILURE;
   }
 
+  // robot_program_running_ is driven by an async callback that may never see a "stopped" edge while the
+  // robot is powered off (the primary interface it comes from is down too); a flag through a power cycle
+  // is not evidence of anything still running, so recoverFromStop() below must not trust it either way.
+  const bool power_cycled = robot_mode_ != static_cast<int32_t>(urcl::RobotMode::RUNNING);
+
   // Power on and release the brakes if needed: on_activate is the ros2_control entry point that enables
   // actuators, the same as any other hardware component's. Brake release moves the arm.
   while (robot_mode_ != static_cast<int32_t>(urcl::RobotMode::RUNNING)) {
@@ -1207,7 +1212,7 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::recoverFromStop(
   // restart a program that didn't need restarting, and the only reason to resend is to make the robot
   // commandable in the first place.
   const bool already_commandable = isCommandable();
-  const bool program_was_running_before_resend = robot_program_running_.load();
+  const bool program_was_running_before_resend = !power_cycled && robot_program_running_.load();
   if (!already_commandable && ur_driver_) {
     try {
       ur_driver_->sendRobotProgram();
