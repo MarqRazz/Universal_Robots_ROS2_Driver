@@ -538,11 +538,12 @@ TEST(URHardwareInterfaceExport, RefusesWhenStopRecoveryInterfacesAreMissing)
   EXPECT_THROW(hardware.export_state_interfaces(), std::exception);
 }
 
-// A refused on_activate (here: no RTDE data ever arrives, since on_configure was never called) must return
-// FAILURE, not ERROR: FAILURE leaves the component at INACTIVE so a later recover can retry it (C32); ERROR
-// routes through on_error(), which this class does not override, leaving it at UNCONFIGURED instead (fails
-// pre-fix: returned ERROR).
-TEST(URHardwareInterfaceExport, ActivateReturnsFailureNotErrorWhenRefused)
+// recoverFromStop's first step pulls RTDE state directly (read() never runs while a lifecycle transition is
+// in progress, so there is nothing to wait on); with no on_configure (ur_driver_ is null) that pull fails,
+// which is a genuine communication loss, not something an operator can act on, so on_activate must return
+// ERROR, not FAILURE. Fails pre-fix: recoverFromStop() returned a bare bool then, and on_activate mapped
+// every refusal, including a lost connection, to FAILURE.
+TEST(URHardwareInterfaceExport, ActivateReturnsErrorWhenRobotStateIsUnreachable)
 {
   ur_robot_driver::URPositionHardwareInterface hw;
   hardware_interface::HardwareComponentInterfaceParams params;
@@ -552,8 +553,7 @@ TEST(URHardwareInterfaceExport, ActivateReturnsFailureNotErrorWhenRefused)
 
   const auto result = hw.on_activate(rclcpp_lifecycle::State());
 
-  EXPECT_EQ(result, hardware_interface::CallbackReturn::FAILURE);
-  EXPECT_NE(result, hardware_interface::CallbackReturn::ERROR);
+  EXPECT_EQ(result, hardware_interface::CallbackReturn::ERROR);
 }
 
 int main(int argc, char** argv)

@@ -65,6 +65,7 @@
 #include "ur_dashboard_msgs/msg/robot_mode.hpp"
 #include "ur_client_library/ur/dashboard_client.h"
 #include "ur_client_library/ur/datatypes.h"
+#include "std_msgs/msg/string.hpp"
 
 // ROS
 #include "rclcpp/macros.hpp"
@@ -156,6 +157,7 @@ public:
   hardware_interface::CallbackReturn on_activate(const rclcpp_lifecycle::State& previous_state) final;
   hardware_interface::CallbackReturn on_cleanup(const rclcpp_lifecycle::State& previous_state) final;
   hardware_interface::CallbackReturn on_shutdown(const rclcpp_lifecycle::State& previous_state) final;
+  hardware_interface::CallbackReturn on_error(const rclcpp_lifecycle::State& previous_state) final;
 
   hardware_interface::return_type read(const rclcpp::Time& time, const rclcpp::Duration& period) final;
   hardware_interface::return_type write(const rclcpp::Time& time, const rclcpp::Duration& period) final;
@@ -192,13 +194,22 @@ protected:
   // True when the robot will execute a command this cycle: program running, runtime PLAYING, safety_mode
   // normal or reduced. Only consulted when stop_recovery_handling_ is set.
   bool isCommandable() const;
-  // Unlocks a protective stop or restarts safety, resends the control program, and waits for isCommandable().
-  // Refuses (returns false) on an e-stop, on local control, or if the robot never becomes commandable.
-  bool recoverFromStop();
+  // Powers on, releases the brakes, unlocks a protective stop or restarts safety, and resends the control
+  // program, re-reading state between each step; FAILURE needs an operator, ERROR is a genuine comms loss.
+  hardware_interface::CallbackReturn recoverFromStop();
   // True once recovery_dashboard_client_ exists. Does not itself (re)connect.
   bool ensureRecoveryDashboard();
-  // Low-rate dashboard query for local/remote control, called from the async thread; RTDE has no field for it.
+  // Pulls one RTDE package directly, the way read() does, and fills robot_mode_/safety_mode_/runtime_state_;
+  // read() does not run while a lifecycle transition is in progress, so recoverFromStop() cannot wait for it.
+  bool pullRobotState();
+  // Synchronous dashboard query for local/remote control, used by recoverFromStop's own refusal check.
+  bool queryLocalControl();
+  // Low-rate dashboard poll feeding the gpio/local_control state interface, called from the async thread;
+  // RTDE has no field for it. recoverFromStop() uses queryLocalControl() directly instead of this value.
   void pollLocalControl();
+  // Latches reason on the stop_reason publisher; a no-op before on_init creates it (e.g. in a unit test with
+  // no executor) or when stop_recovery_handling_ is off.
+  void publishStopReason(const std::string& reason);
 
   // The driver keeps working on its member variables. Each exported interface handle is paired with the member that
   // holds its value, and both are synchronized at fixed points:
@@ -269,10 +280,6 @@ protected:
   Quaternion tcp_rotation_buffer;
 
   bool packet_read_;
-  // Set once read() has processed its first RTDE packet. on_activate can run before the control loop's
-  // first read() (confirmed live: the very first activation attempt after on_configure races ahead of RTDE),
-  // so recoverFromStop() waits on this before trusting robot_mode_/safety_mode_.
-  std::atomic_bool first_packet_received_{ false };
 
   uint32_t runtime_state_;
   bool controllers_initialized_;
@@ -524,6 +531,17 @@ protected:
   std::atomic<bool> local_control_atomic_{ false };
   double local_control_;
   int local_control_poll_counter_{ 0 };
+
+  // Latched (transient_local) so a late subscriber still sees the last reason; created in on_init, so it
+  // exists in every lifecycle state, including before the robot is ever connected. Null without an executor
+  // (get_node() returns null then, e.g. in a unit test), in which case publishStopReason() is a no-op.
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr stop_reason_pub_;
+
+  // read()'s RTDE outage watchdog: the last cycle a packet actually arrived, and a throttle counter for the
+  // warning logged on every cycle until read() reports ERROR past the bound. on_activate seeds this once
+  // commandable, so the outage clock starts counting from a known-good moment, not on_configure's connect.
+  std::chrono::steady_clock::time_point last_rtde_packet_;
+  int rtde_outage_warn_counter_{ 0 };
 };
 }  // namespace ur_robot_driver
 

@@ -133,6 +133,14 @@ URPositionHardwareInterface::on_init(const hardware_interface::HardwareComponent
   stop_recovery_handling_ = stop_recovery_it != info_.hardware_parameters.end() &&
                             (stop_recovery_it->second == "true" || stop_recovery_it->second == "True");
   local_control_ = 0.0;
+  last_rtde_packet_ = std::chrono::steady_clock::now();
+
+  // Created here, not on_configure: this interface exists in every lifecycle state, including before the
+  // robot is ever connected. Null without an executor (get_node() returns null then; publishStopReason()
+  // no-ops in that case).
+  if (auto node = get_node()) {
+    stop_reason_pub_ = node->create_publisher<std_msgs::msg::String>("~/stop_reason", rclcpp::QoS(1).transient_local());
+  }
 
   // initialize
   urcl_joint_positions_ = { { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 } };
@@ -892,7 +900,6 @@ URPositionHardwareInterface::on_configure(const rclcpp_lifecycle::State& previou
     }
 
     rtde_comm_has_been_started_ = false;
-    first_packet_received_ = false;
     urcl::UrDriverConfiguration driver_config;
     driver_config.robot_ip = robot_ip;
     driver_config.script_file = script_filename;
@@ -959,7 +966,11 @@ URPositionHardwareInterface::on_configure(const rclcpp_lifecycle::State& previou
     const auto client_policy = version_info_.major >= 10 ? urcl::DashboardClient::ClientPolicy::POLYSCOPE_X :
                                                            urcl::DashboardClient::ClientPolicy::G5;
     recovery_dashboard_client_ = std::make_unique<urcl::DashboardClient>(robot_ip, client_policy);
-    if (!recovery_dashboard_client_->connect(3, std::chrono::seconds(2))) {
+    if (recovery_dashboard_client_->connect(3, std::chrono::seconds(2))) {
+      // Seeded here, synchronously, rather than left at its default false (remote) until pollLocalControl's
+      // first tick: a state interface read in that window would otherwise report the wrong value.
+      local_control_atomic_ = queryLocalControl();
+    } else {
       RCLCPP_ERROR(rclcpp::get_logger("URPositionHardwareInterface"),
                    "stop_recovery_handling is set, but connecting to the dashboard server at '%s' failed. "
                    "on_activate will refuse to recover a stop until this is fixed.",
@@ -1048,14 +1059,7 @@ URPositionHardwareInterface::on_activate(const rclcpp_lifecycle::State& previous
   if (!stop_recovery_handling_) {
     return hardware_interface::CallbackReturn::SUCCESS;
   }
-
-  // FAILURE, not ERROR: a refused activation leaves the component at INACTIVE so a later recover can
-  // retry (hardware_component.cpp's activate()); ERROR routes through on_error(), which this class does not
-  // override, so the default on_error leaves the component at UNCONFIGURED without running stop() -- the RTDE
-  // connection and its input recipe are never released, and the next on_configure's reconnect collides with
-  // the still-open one (confirmed live against URSim: "speed_slider_mask is currently controlled by another
-  // RTDE client").
-  return recoverFromStop() ? hardware_interface::CallbackReturn::SUCCESS : hardware_interface::CallbackReturn::FAILURE;
+  return recoverFromStop();
 }
 
 bool URPositionHardwareInterface::isCommandable() const
@@ -1070,59 +1074,91 @@ bool URPositionHardwareInterface::ensureRecoveryDashboard()
   return stop_recovery_handling_ && recovery_dashboard_client_ != nullptr;
 }
 
-bool URPositionHardwareInterface::recoverFromStop()
+bool URPositionHardwareInterface::pullRobotState()
+{
+  if (!ur_driver_) {
+    return false;
+  }
+  if (!rtde_comm_has_been_started_) {
+    ur_driver_->startRTDECommunication(non_blocking_read_);
+    rtde_comm_has_been_started_ = true;
+  }
+  // read() never runs while this transition is in progress (hardware_component.cpp pauses it), so this
+  // pulls a package the same way read() does, rather than waiting for one. Bounded retries: non_blocking_read_
+  // returns immediately with nothing until the next RTDE cycle.
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    if (get_data_package()) {
+      readData(data_package_buffer_, "robot_mode", robot_mode_);
+      readData(data_package_buffer_, "safety_mode", safety_mode_);
+      readData(data_package_buffer_, "runtime_state", runtime_state_);
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return false;
+}
+
+bool URPositionHardwareInterface::queryLocalControl()
+{
+  try {
+    return !recovery_dashboard_client_->commandIsInRemoteControl();
+  } catch (const urcl::UrException&) {
+    return false;  // CB3 has no remote-control concept.
+  }
+}
+
+hardware_interface::CallbackReturn URPositionHardwareInterface::recoverFromStop()
 {
   const auto* logger_name = "URPositionHardwareInterface";
 
   // One shared deadline for the whole function, not one per phase: amp_device_node's recover() has a single
   // request_timeout_s (10 s) budget for the whole activation, so a per-phase timeout that each independently
   // waited its own worst case could add up past that regardless of any single phase's own limit. 7 s leaves
-  // margin for the service round trip around this call. Power-on and brake release measured well under 1 s
-  // against URSim; UR's own documentation puts it at a few seconds on real hardware, which is what this
-  // budget is actually sized for.
+  // margin for the service round trip around this call.
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
   const auto timed_out = [&] { return std::chrono::steady_clock::now() > deadline; };
 
-  // ros2_control_node's own startup can call on_activate before the control loop's first read(), so
-  // robot_mode_/safety_mode_ may still hold on_configure's pre-read defaults rather than the robot's actual
-  // state. Wait for read() to have processed at least one RTDE packet; bounded, since a connection that never
-  // delivers one is itself a reason to refuse.
-  while (!first_packet_received_) {
-    if (timed_out()) {
-      RCLCPP_ERROR(rclcpp::get_logger(logger_name),
-                   "Cannot activate: no RTDE data received; cannot read robot_mode or safety_mode.");
-      return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  if (!pullRobotState()) {
+    RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: no RTDE data; communication is lost.");
+    return hardware_interface::CallbackReturn::ERROR;
   }
-
   if (safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::ROBOT_EMERGENCY_STOP) ||
       safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::SYSTEM_EMERGENCY_STOP)) {
-    RCLCPP_ERROR(rclcpp::get_logger(logger_name),
-                 "Cannot activate: an e-stop is active (safety_mode %d). Release it at the robot.", safety_mode_);
-    return false;
-  }
-  if (local_control_atomic_) {
-    RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: the robot is in local control.");
-    return false;
+    const std::string reason = "Cannot activate: an e-stop is active. Release it at the robot.";
+    RCLCPP_ERROR(rclcpp::get_logger(logger_name), "%s", reason.c_str());
+    publishStopReason(reason);
+    return hardware_interface::CallbackReturn::FAILURE;
   }
   if (!ensureRecoveryDashboard()) {
     RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: the recovery dashboard connection is unavailable.");
-    return false;
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+  if (queryLocalControl()) {
+    const std::string reason = "Cannot activate: the robot is in local control.";
+    RCLCPP_ERROR(rclcpp::get_logger(logger_name), "%s", reason.c_str());
+    publishStopReason(reason);
+    return hardware_interface::CallbackReturn::FAILURE;
   }
 
   // Power on and release the brakes if needed: on_activate is the ros2_control entry point that enables
   // actuators, the same as any other hardware component's. Brake release moves the arm.
-  if (robot_mode_ != static_cast<int32_t>(urcl::RobotMode::RUNNING)) {
-    recovery_dashboard_client_->commandPowerOn();
-    recovery_dashboard_client_->commandBrakeRelease();
-    while (robot_mode_ != static_cast<int32_t>(urcl::RobotMode::RUNNING)) {
-      if (timed_out()) {
-        RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: robot_mode %d did not reach RUNNING.",
-                     robot_mode_);
-        return false;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  while (robot_mode_ != static_cast<int32_t>(urcl::RobotMode::RUNNING)) {
+    if (robot_mode_ == static_cast<int32_t>(urcl::RobotMode::POWER_OFF)) {
+      recovery_dashboard_client_->commandPowerOn();
+    } else {
+      recovery_dashboard_client_->commandBrakeRelease();
+    }
+    if (timed_out()) {
+      const std::string reason = "Cannot activate: robot_mode " + std::to_string(robot_mode_) +
+                                 " did not reach RUNNING (power on / brake release did not complete in time).";
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "%s", reason.c_str());
+      publishStopReason(reason);
+      return hardware_interface::CallbackReturn::FAILURE;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!pullRobotState()) {
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: no RTDE data; communication is lost.");
+      return hardware_interface::CallbackReturn::ERROR;
     }
   }
 
@@ -1137,15 +1173,24 @@ bool URPositionHardwareInterface::recoverFromStop()
       recovery_dashboard_client_->commandRestartSafety();
     } else {
       // safety_mode moved to something neither call clears, e.g. an e-stop appeared mid-recovery.
-      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: safety_mode %d needs an operator at the robot.",
-                   safety_mode_);
-      return false;
+      const std::string reason =
+          "Cannot activate: safety_mode " + std::to_string(safety_mode_) + " needs an operator at the robot.";
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "%s", reason.c_str());
+      publishStopReason(reason);
+      return hardware_interface::CallbackReturn::FAILURE;
     }
     if (timed_out()) {
-      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: safety_mode %d did not clear.", safety_mode_);
-      return false;
+      const std::string reason =
+          "Cannot activate: safety_mode " + std::to_string(safety_mode_) + " did not clear in time.";
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "%s", reason.c_str());
+      publishStopReason(reason);
+      return hardware_interface::CallbackReturn::FAILURE;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (!pullRobotState()) {
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: no RTDE data; communication is lost.");
+      return hardware_interface::CallbackReturn::ERROR;
+    }
   }
 
   if (ur_driver_) {
@@ -1158,21 +1203,37 @@ bool URPositionHardwareInterface::recoverFromStop()
 
   while (!isCommandable()) {
     if (timed_out()) {
-      RCLCPP_ERROR(rclcpp::get_logger(logger_name),
-                   "Cannot activate: the control program did not reach PLAYING (runtime_state %u, "
-                   "program_running %d, safety_mode %d).",
-                   runtime_state_, robot_program_running_.load(), safety_mode_);
-      return false;
+      const std::string reason = "Cannot activate: the control program did not reach PLAYING (runtime_state " +
+                                 std::to_string(runtime_state_) + ", program_running " +
+                                 std::to_string(robot_program_running_.load()) + ", safety_mode " +
+                                 std::to_string(safety_mode_) + ").";
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "%s", reason.c_str());
+      publishStopReason(reason);
+      return hardware_interface::CallbackReturn::FAILURE;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!pullRobotState()) {
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: no RTDE data; communication is lost.");
+      return hardware_interface::CallbackReturn::ERROR;
+    }
   }
-  return true;
+  // Seeds read()'s outage watchdog from this known-good moment, not on_configure's connect.
+  last_rtde_packet_ = std::chrono::steady_clock::now();
+  return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn
 URPositionHardwareInterface::on_cleanup(const rclcpp_lifecycle::State& previous_state)
 {
   RCLCPP_DEBUG(rclcpp::get_logger("URPositionHardwareInterface"), "on_cleanup");
+  return stop();
+}
+
+hardware_interface::CallbackReturn URPositionHardwareInterface::on_error(const rclcpp_lifecycle::State& previous_state)
+{
+  // Without this override the base on_error leaves the RTDE and dashboard connections open while landing
+  // at UNCONFIGURED, so the next on_configure's reconnect collides with the still-open one.
+  RCLCPP_DEBUG(rclcpp::get_logger("URPositionHardwareInterface"), "on_error");
   return stop();
 }
 
@@ -1252,6 +1313,15 @@ void URPositionHardwareInterface::asyncThread()
 hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::Time& time,
                                                                   const rclcpp::Duration& period)
 {
+  if (!ur_driver_) {
+    // read() can run while INACTIVE, which includes the moment right after on_error has reset the
+    // connection; the framework's own lifecycle handling reconnects, not another ERROR from here.
+    if (stop_recovery_handling_ && (++rtde_outage_warn_counter_ % 500 == 0)) {
+      RCLCPP_WARN(rclcpp::get_logger("URPositionHardwareInterface"), "read(): not connected.");
+    }
+    return hardware_interface::return_type::OK;
+  }
+
   // We want to start the rtde comm the latest point possible due to the delay times arising from setting up the
   // communication with multiple arms
   if (!rtde_comm_has_been_started_) {
@@ -1260,6 +1330,8 @@ hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::
   }
 
   if (get_data_package()) {
+    last_rtde_packet_ = std::chrono::steady_clock::now();
+    rtde_outage_warn_counter_ = 0;
     packet_read_ = true;
     readData(data_package_buffer_, "actual_q", urcl_joint_positions_);
     readData(data_package_buffer_, "actual_qd", urcl_joint_velocities_);
@@ -1291,7 +1363,6 @@ hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::
     readData(data_package_buffer_, "tool_temperature", tool_temperature_);
     readData(data_package_buffer_, "robot_mode", robot_mode_);
     readData(data_package_buffer_, "safety_mode", safety_mode_);
-    first_packet_received_ = true;
     readBitsetData<uint32_t>(data_package_buffer_, "robot_status_bits", robot_status_bits_);
     readBitsetData<uint32_t>(data_package_buffer_, "safety_status_bits", safety_status_bits_);
     readBitsetData<uint64_t>(data_package_buffer_, "actual_digital_input_bits", actual_dig_in_bits_);
@@ -1368,10 +1439,18 @@ hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::
     RCLCPP_ERROR(rclcpp::get_logger("URPositionHardwareInterface"), "Unable to read from hardware...");
   // States can also change outside of read(), e.g. in write() or in callbacks.
   push_state_mirrors();
-  // A blocking read that returned nothing is an RTDE loss; non_blocking_read_ has no such signal, since an
-  // empty poll is the normal case there.
-  if (stop_recovery_handling_ && !non_blocking_read_) {
-    return hardware_interface::return_type::ERROR;
+  if (stop_recovery_handling_) {
+    // Bounded outage, not an immediate ERROR on one missed cycle: non_blocking_read_ has no other signal,
+    // since an empty poll is the normal case there, and even a blocking read can miss one cycle under load.
+    const auto outage = std::chrono::steady_clock::now() - last_rtde_packet_;
+    if (outage > std::chrono::milliseconds(1000)) {
+      RCLCPP_ERROR(rclcpp::get_logger("URPositionHardwareInterface"),
+                   "No RTDE data for over 1 s; reporting ERROR so on_error resets the connection.");
+      return hardware_interface::return_type::ERROR;
+    }
+    if (++rtde_outage_warn_counter_ % 250 == 0) {
+      RCLCPP_WARN(rclcpp::get_logger("URPositionHardwareInterface"), "No RTDE packet this cycle.");
+    }
   }
   return hardware_interface::return_type::OK;
 }
@@ -1745,11 +1824,17 @@ void URPositionHardwareInterface::pollLocalControl()
   if (!ensureRecoveryDashboard()) {
     return;
   }
-  try {
-    local_control_atomic_ = !recovery_dashboard_client_->commandIsInRemoteControl();
-  } catch (const urcl::UrException&) {
-    // CB3 robots do not support the query; leave the last known value.
+  local_control_atomic_ = queryLocalControl();
+}
+
+void URPositionHardwareInterface::publishStopReason(const std::string& reason)
+{
+  if (!stop_reason_pub_) {
+    return;
   }
+  std_msgs::msg::String msg;
+  msg.data = reason;
+  stop_reason_pub_->publish(msg);
 }
 
 void URPositionHardwareInterface::check_tool_contact_controller()
