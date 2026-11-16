@@ -35,7 +35,7 @@
     <!-- tool_voltage_t2 uses single quotes because this params attribute is double-quoted. An empty value means do not set a startup voltage. -->
     <!-- rw_rate of 0 uses the rate of the controller_manager -->
     <!-- stop_recovery_handling is opt-in: write() -> DEACTIVATE on a stop, read() -> ERROR on an RTDE
-         loss, on_activate recovery, and the initialize/request and gpio/local_control interfaces below.
+         loss, on_activate recovery (including power-on/brake-release), and gpio/local_control below.
          Off, the driver behaves exactly as it does without this parameter. -->
 
     <xacro:property name="config_kinematics_parameters" value="${xacro.load_yaml(kinematics_parameters_file)}"/>
@@ -257,14 +257,6 @@
           <state_interface name="local_control"/>
         </xacro:if>
       </gpio>
-
-      <!-- Power the arm on and release the brakes; on_activate only does the remotely clearable recovery. -->
-      <xacro:if value="${stop_recovery_handling}">
-        <gpio name="${tf_prefix}initialize">
-          <command_interface name="request"/>
-          <state_interface name="done"/>
-        </gpio>
-      </xacro:if>
 
       <gpio name="${tf_prefix}payload">
         <command_interface name="mass"/>

@@ -166,10 +166,6 @@ hardware_interface::HardwareInfo BuildTestHardwareInfo(bool stop_recovery_handli
   }
   make_gpio("gpio", gpio_cmds, gpio_states);
 
-  if (stop_recovery_handling) {
-    make_gpio("initialize", { "request" }, { "done" });
-  }
-
   make_gpio("payload",
             { "mass", "cog.x", "cog.y", "cog.z", "inertia.ixx", "inertia.iyy", "inertia.izz", "inertia.ixy",
               "inertia.ixz", "inertia.iyz", "transition_time", "payload_async_success" },
@@ -504,9 +500,8 @@ TEST(URHardwareInterfaceExport, SupportsDescriptionsWithoutEffortCommands)
   }
 }
 
-// stop_recovery_handling is opt-in: with the description declaring gpio/local_control and the
-// initialize gpio (as ur.ros2_control.xacro does when the parameter is set), initialization succeeds and
-// both are exported.
+// stop_recovery_handling is opt-in: with the description declaring gpio/local_control (as
+// ur.ros2_control.xacro does when the parameter is set), initialization succeeds and it is exported.
 TEST(URHardwareInterfaceExport, ExportsStopRecoveryInterfacesWhenEnabled)
 {
   hardware_interface::HardwareComponentParams params;
@@ -519,11 +514,8 @@ TEST(URHardwareInterfaceExport, ExportsStopRecoveryInterfacesWhenEnabled)
   ASSERT_EQ(state.id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
 
   const auto state_names = GetNames(hardware.export_state_interfaces());
-  const auto command_names = GetNames(hardware.export_command_interfaces());
 
   EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "gpio/local_control"));
-  EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "initialize/done"));
-  EXPECT_THAT(command_names, ::testing::Contains(std::string(kTfPrefix) + "initialize/request"));
 }
 
 // The discriminating case: the hardware parameter is set but the description was not updated to match (a

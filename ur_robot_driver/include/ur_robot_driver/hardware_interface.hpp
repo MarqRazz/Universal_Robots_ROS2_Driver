@@ -509,19 +509,15 @@ protected:
   urcl::ControlBoxType control_box_type_ = urcl::ControlBoxType::UNKNOWN;
 
   // Opt-in hardware-contract behaviour: write() -> DEACTIVATE on an uncommandable stop, read() -> ERROR
-  // on an RTDE loss, on_activate recovery, and the initialize/request and gpio/local_control interfaces.
-  // Off by default, so upstream behaviour (controller_stopper, robot_state_helper) is unchanged.
+  // on an RTDE loss, on_activate recovery (including power-on/brake-release), and the gpio/local_control
+  // state interface. Off by default, so upstream behaviour (controller_stopper, robot_state_helper) is
+  // unchanged.
   bool stop_recovery_handling_{ false };
 
   // Dashboard connection used only for recovery and the local-control poll. Independent of RTDE, so it
   // survives the loss read() reports, and of the reverse interface, so on_activate can use it before the
   // control program reconnects.
   std::unique_ptr<urcl::DashboardClient> recovery_dashboard_client_;
-
-  // initialize/request (command), initialize/done (state): power the arm on and release the brakes
-  // (contract section 4.4). Handled asynchronously in checkAsyncIO, like the other async commands.
-  double initialize_request_cmd_;
-  double initialize_done_;
 
   // Local/remote control (state only), 1.0 local / 0.0 remote. Filled by pollLocalControl from the async
   // thread; local_control_ is the value read() publishes, synchronized from the atomic once per cycle.

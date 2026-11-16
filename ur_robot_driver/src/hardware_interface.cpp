@@ -132,8 +132,6 @@ URPositionHardwareInterface::on_init(const hardware_interface::HardwareComponent
   const auto stop_recovery_it = info_.hardware_parameters.find("stop_recovery_handling");
   stop_recovery_handling_ = stop_recovery_it != info_.hardware_parameters.end() &&
                             (stop_recovery_it->second == "true" || stop_recovery_it->second == "True");
-  initialize_request_cmd_ = NO_NEW_CMD_;
-  initialize_done_ = 0.0;
   local_control_ = 0.0;
 
   // initialize
@@ -435,9 +433,8 @@ URPositionHardwareInterface::on_export_state_interfaces()
   add_state_mirror(tf_prefix + HW_IF_MOTION_PRIMITIVES, "ready_for_new_primitive", &hw_moprim_states_[1]);
 
   // Declared in the description only when stop_recovery_handling is set (see ur.ros2_control.xacro),
-  // so these mirrors are added to match; add_state_mirror would otherwise throw on an undeclared interface.
+  // so this mirror is added to match; add_state_mirror would otherwise throw on an undeclared interface.
   if (stop_recovery_handling_) {
-    add_state_mirror(tf_prefix + "initialize", "done", &initialize_done_);
     add_state_mirror(tf_prefix + "gpio", "local_control", &local_control_);
   }
 
@@ -638,10 +635,6 @@ std::vector<hardware_interface::CommandInterface::SharedPtr> URPositionHardwareI
   });
 
   freedrive_mode_abort_handle_ = get_command_interface_handle(tf_prefix + FREEDRIVE_MODE_GPIO + "/abort");
-
-  if (stop_recovery_handling_) {
-    add_async_command_mirror(tf_prefix + "initialize", "request", &initialize_request_cmd_);
-  }
 
   return exported_interfaces;
 }
@@ -1081,29 +1074,28 @@ bool URPositionHardwareInterface::recoverFromStop()
 {
   const auto* logger_name = "URPositionHardwareInterface";
 
+  // One shared deadline for the whole function, not one per phase: amp_device_node's recover() has a single
+  // request_timeout_s (10 s) budget for the whole activation, so a per-phase timeout that each independently
+  // waited its own worst case could add up past that regardless of any single phase's own limit. 7 s leaves
+  // margin for the service round trip around this call. Power-on and brake release measured well under 1 s
+  // against URSim; UR's own documentation puts it at a few seconds on real hardware, which is what this
+  // budget is actually sized for.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
+  const auto timed_out = [&] { return std::chrono::steady_clock::now() > deadline; };
+
   // ros2_control_node's own startup can call on_activate before the control loop's first read(), so
   // robot_mode_/safety_mode_ may still hold on_configure's pre-read defaults rather than the robot's actual
   // state. Wait for read() to have processed at least one RTDE packet; bounded, since a connection that never
   // delivers one is itself a reason to refuse.
-  const auto packet_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
   while (!first_packet_received_) {
-    if (std::chrono::steady_clock::now() > packet_deadline) {
+    if (timed_out()) {
       RCLCPP_ERROR(rclcpp::get_logger(logger_name),
-                   "Cannot activate: no RTDE data received within 3 s; cannot read robot_mode or safety_mode.");
+                   "Cannot activate: no RTDE data received; cannot read robot_mode or safety_mode.");
       return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
 
-  // robot_mode_ not RUNNING (powered off, brakes on) is NOT_INITIALIZED: a released e-stop leaves the robot
-  // here, and only initialize/request clears it, because power-on and brake release move the arm and
-  // on_activate must not.
-  if (robot_mode_ != static_cast<int32_t>(urcl::RobotMode::RUNNING)) {
-    RCLCPP_ERROR(rclcpp::get_logger(logger_name),
-                 "Cannot activate: robot_mode %d is not RUNNING. Use the initialize/request interface first.",
-                 robot_mode_);
-    return false;
-  }
   if (safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::ROBOT_EMERGENCY_STOP) ||
       safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::SYSTEM_EMERGENCY_STOP)) {
     RCLCPP_ERROR(rclcpp::get_logger(logger_name),
@@ -1119,9 +1111,23 @@ bool URPositionHardwareInterface::recoverFromStop()
     return false;
   }
 
+  // Power on and release the brakes if needed: on_activate is the ros2_control entry point that enables
+  // actuators, the same as any other hardware component's. Brake release moves the arm.
+  if (robot_mode_ != static_cast<int32_t>(urcl::RobotMode::RUNNING)) {
+    recovery_dashboard_client_->commandPowerOn();
+    recovery_dashboard_client_->commandBrakeRelease();
+    while (robot_mode_ != static_cast<int32_t>(urcl::RobotMode::RUNNING)) {
+      if (timed_out()) {
+        RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: robot_mode %d did not reach RUNNING.",
+                     robot_mode_);
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+
   // Unlock a protective stop (refused for 5 s after it trips, so retry) or restart safety on a fault or
   // violation; an e-stop is refused above instead, since it is not clearable this way.
-  const auto safety_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (!(safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::NORMAL) ||
            safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::REDUCED))) {
     if (safety_mode_ == static_cast<int32_t>(urcl::SafetyMode::PROTECTIVE_STOP)) {
@@ -1135,9 +1141,8 @@ bool URPositionHardwareInterface::recoverFromStop()
                    safety_mode_);
       return false;
     }
-    if (std::chrono::steady_clock::now() > safety_deadline) {
-      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: safety_mode %d did not clear within 10 s.",
-                   safety_mode_);
+    if (timed_out()) {
+      RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: safety_mode %d did not clear.", safety_mode_);
       return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -1151,11 +1156,10 @@ bool URPositionHardwareInterface::recoverFromStop()
     }
   }
 
-  const auto program_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (!isCommandable()) {
-    if (std::chrono::steady_clock::now() > program_deadline) {
+    if (timed_out()) {
       RCLCPP_ERROR(rclcpp::get_logger(logger_name),
-                   "Cannot activate: the control program did not reach PLAYING within 5 s (runtime_state %u, "
+                   "Cannot activate: the control program did not reach PLAYING (runtime_state %u, "
                    "program_running %d, safety_mode %d).",
                    runtime_state_, robot_program_running_.load(), safety_mode_);
       return false;
@@ -1724,14 +1728,6 @@ void URPositionHardwareInterface::checkAsyncIO()
   }
 
   if (stop_recovery_handling_) {
-    if (!std::isnan(initialize_request_cmd_)) {
-      if (ensureRecoveryDashboard()) {
-        // Blocking dashboard calls; fine here, this thread is not real-time (see the comment above).
-        recovery_dashboard_client_->commandPowerOn();
-        recovery_dashboard_client_->commandBrakeRelease();
-      }
-      initialize_request_cmd_ = NO_NEW_CMD_;
-    }
     pollLocalControl();
   }
 
@@ -1809,7 +1805,6 @@ void URPositionHardwareInterface::updateNonDoubleValues()
   system_interface_initialized_ = initialized_ ? 1.0 : 0.0;
   robot_program_running_copy_ = robot_program_running_ ? 1.0 : 0.0;
   if (stop_recovery_handling_) {
-    initialize_done_ = robot_mode_ == static_cast<int32_t>(urcl::RobotMode::RUNNING) ? 1.0 : 0.0;
     local_control_ = local_control_atomic_ ? 1.0 : 0.0;
   }
 }
