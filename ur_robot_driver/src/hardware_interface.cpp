@@ -40,6 +40,9 @@
  */
 //----------------------------------------------------------------------
 #include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -143,6 +146,7 @@ URPositionHardwareInterface::on_init(const hardware_interface::HardwareComponent
   remote_control_atomic_ = std::numeric_limits<double>::quiet_NaN();
   remote_control_ = std::numeric_limits<double>::quiet_NaN();
   calibration_matches_ = std::numeric_limits<double>::quiet_NaN();
+  serial_number_ = std::numeric_limits<double>::quiet_NaN();
   last_rtde_packet_ = std::chrono::steady_clock::now();
 
   // Created here, not on_configure: this interface exists in every lifecycle state, including before the
@@ -455,6 +459,7 @@ URPositionHardwareInterface::on_export_state_interfaces()
   if (stop_recovery_handling_) {
     add_state_mirror(tf_prefix + "gpio", "remote_control", &remote_control_);
     add_state_mirror(tf_prefix + "gpio", "calibration_matches", &calibration_matches_);
+    add_state_mirror(tf_prefix + "gpio", "serial_number", &serial_number_);
   }
 
   return exported_interfaces;
@@ -980,6 +985,18 @@ URPositionHardwareInterface::on_configure(const rclcpp_lifecycle::State& previou
     if (recovery_dashboard_client_->connect(3, std::chrono::seconds(2))) {
       std::lock_guard<std::mutex> dashboard_lock(recovery_dashboard_mutex_);
       remote_control_atomic_ = remoteControlValue(queryRemoteControl());
+      std::string serial_number;
+      try {
+        recovery_dashboard_client_->commandGetSerialNumber(serial_number);
+      } catch (const std::exception& e) {
+        RCLCPP_WARN(rclcpp::get_logger("URPositionHardwareInterface"), "get serial number failed: %s", e.what());
+      }
+      serial_number_ = SerialNumberValue(serial_number);
+      if (std::isnan(serial_number_)) {
+        RCLCPP_WARN(rclcpp::get_logger("URPositionHardwareInterface"),
+                    "Serial number '%s' is not a number a double holds exactly; gpio/serial_number stays NaN.",
+                    serial_number.c_str());
+      }
     } else {
       RCLCPP_ERROR(rclcpp::get_logger("URPositionHardwareInterface"),
                    "stop_recovery_handling is set, but connecting to the dashboard server at '%s' failed. "
@@ -1089,6 +1106,17 @@ bool URPositionHardwareInterface::ConfirmsProgramRestart(bool program_was_runnin
     seen_program_stop = program_running_now ? !program_was_running_before_resend : true;
   }
   return seen_program_stop && commandable_now;
+}
+
+double URPositionHardwareInterface::SerialNumberValue(const std::string& serial_number)
+{
+  constexpr uint64_t kMaxExact = uint64_t{ 1 } << 53;
+  if (serial_number.empty() || serial_number.size() > 16 ||
+      !std::all_of(serial_number.begin(), serial_number.end(), [](unsigned char c) { return std::isdigit(c); })) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const uint64_t value = std::stoull(serial_number);
+  return value <= kMaxExact ? static_cast<double>(value) : std::numeric_limits<double>::quiet_NaN();
 }
 
 bool URPositionHardwareInterface::ensureRecoveryDashboard()

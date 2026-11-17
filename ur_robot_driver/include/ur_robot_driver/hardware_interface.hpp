@@ -204,6 +204,8 @@ protected:
   // (or there was no old program to confuse it with).
   static bool ConfirmsProgramRestart(bool program_was_running_before_resend, bool program_running_now,
                                      bool commandable_now, bool& seen_program_stop);
+  // The dashboard's serial number as a double, or NaN unless it is all digits and at most 2^53 (exact in a double).
+  static double SerialNumberValue(const std::string& serial_number);
   // Powers on, releases the brakes, unlocks a protective stop or restarts safety, and resends the control
   // program, re-reading state between each step; FAILURE needs an operator, ERROR is a genuine comms loss.
   hardware_interface::CallbackReturn recoverFromStop();
@@ -548,6 +550,8 @@ protected:
 
   // 1.0 when the robot's calibration matches kinematics/hash, 0.0 when not, NaN before on_configure checks.
   double calibration_matches_{ std::numeric_limits<double>::quiet_NaN() };
+  // Read once in on_configure; NaN when the dashboard did not give a numeric serial.
+  double serial_number_{ std::numeric_limits<double>::quiet_NaN() };
 
   // Latched (transient_local) so a late subscriber still sees the last reason; created in on_init, so it
   // exists in every lifecycle state, including before the robot is ever connected. Null without an executor

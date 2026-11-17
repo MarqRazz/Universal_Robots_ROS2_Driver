@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -166,6 +167,7 @@ hardware_interface::HardwareInfo BuildTestHardwareInfo(bool stop_recovery_handli
   if (stop_recovery_handling) {
     gpio_states.push_back("remote_control");
     gpio_states.push_back("calibration_matches");
+    gpio_states.push_back("serial_number");
   }
   make_gpio("gpio", gpio_cmds, gpio_states);
 
@@ -520,6 +522,7 @@ TEST(URHardwareInterfaceExport, ExportsStopRecoveryInterfacesWhenEnabled)
 
   EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "gpio/remote_control"));
   EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "gpio/calibration_matches"));
+  EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "gpio/serial_number"));
   EXPECT_THAT(state_names, ::testing::Not(::testing::Contains(std::string(kTfPrefix) + "gpio/local_control")));
 }
 
@@ -566,6 +569,7 @@ class TestableHardwareInterface : public ur_robot_driver::URPositionHardwareInte
 {
 public:
   using ur_robot_driver::URPositionHardwareInterface::ConfirmsProgramRestart;
+  using ur_robot_driver::URPositionHardwareInterface::SerialNumberValue;
 };
 
 // recoverFromStop() resends the program unconditionally, then (pre-fix) checked isCommandable()
@@ -610,6 +614,23 @@ TEST(URHardwareInterfaceExport, ConfirmsProgramRestartAcceptsFirstRunWithNothing
   EXPECT_TRUE(TestableHardwareInterface::ConfirmsProgramRestart(
       /*program_was_running_before_resend=*/false, /*program_running_now=*/true,
       /*commandable_now=*/true, seen_program_stop));
+}
+
+TEST(URHardwareInterfaceExport, SerialNumberValueIsExactForNumericSerials)
+{
+  const double value = TestableHardwareInterface::SerialNumberValue("20236999999");
+  EXPECT_EQ(value, 20236999999.0);
+  EXPECT_EQ(static_cast<int64_t>(value), int64_t{ 20236999999 });
+  EXPECT_EQ(TestableHardwareInterface::SerialNumberValue("9007199254740992"), 9007199254740992.0);
+}
+
+// 2^53 + 1 would round to 2^53 and report a different robot's serial; anything non-numeric has no double form.
+TEST(URHardwareInterfaceExport, SerialNumberValueIsNaNWhenNotExact)
+{
+  EXPECT_TRUE(std::isnan(TestableHardwareInterface::SerialNumberValue("9007199254740993")));
+  EXPECT_TRUE(std::isnan(TestableHardwareInterface::SerialNumberValue("20236A99999")));
+  EXPECT_TRUE(std::isnan(TestableHardwareInterface::SerialNumberValue("")));
+  EXPECT_TRUE(std::isnan(TestableHardwareInterface::SerialNumberValue("12345678901234567")));
 }
 
 // Stands in for the robot: pulled state is commandable, and the dashboard answers is_in_remote_control with

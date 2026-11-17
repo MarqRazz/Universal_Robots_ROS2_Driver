@@ -252,10 +252,11 @@
           </xacro:if>
         </state_interface>
 
-        <!-- Not in RTDE: remote_control is polled from the dashboard, calibration_matches is set in on_configure. -->
+        <!-- Not in RTDE: remote_control is polled from the dashboard, calibration_matches and serial_number are set in on_configure. -->
         <xacro:if value="${stop_recovery_handling}">
           <state_interface name="remote_control"/>
           <state_interface name="calibration_matches"/>
+          <state_interface name="serial_number"/>
         </xacro:if>
       </gpio>
 
