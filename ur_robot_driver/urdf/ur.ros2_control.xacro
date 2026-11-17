@@ -35,7 +35,7 @@
     <!-- tool_voltage_t2 uses single quotes because this params attribute is double-quoted. An empty value means do not set a startup voltage. -->
     <!-- rw_rate of 0 uses the rate of the controller_manager -->
     <!-- stop_recovery_handling is opt-in: write() -> DEACTIVATE on a stop, read() -> ERROR on an RTDE
-         loss, on_activate recovery (including power-on/brake-release), and gpio/local_control below.
+         loss, on_activate recovery (including power-on/brake-release), and the gated gpio state interfaces below.
          Off, the driver behaves exactly as it does without this parameter. -->
 
     <xacro:property name="config_kinematics_parameters" value="${xacro.load_yaml(kinematics_parameters_file)}"/>
@@ -254,7 +254,7 @@
 
         <!-- RTDE has no field for this; the driver polls the dashboard at a low rate instead. -->
         <xacro:if value="${stop_recovery_handling}">
-          <state_interface name="local_control"/>
+          <state_interface name="remote_control"/>
         </xacro:if>
       </gpio>
 

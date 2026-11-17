@@ -41,8 +41,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -162,7 +164,7 @@ hardware_interface::HardwareInfo BuildTestHardwareInfo(bool stop_recovery_handli
   }
   gpio_states.push_back("program_running");
   if (stop_recovery_handling) {
-    gpio_states.push_back("local_control");
+    gpio_states.push_back("remote_control");
   }
   make_gpio("gpio", gpio_cmds, gpio_states);
 
@@ -500,7 +502,7 @@ TEST(URHardwareInterfaceExport, SupportsDescriptionsWithoutEffortCommands)
   }
 }
 
-// stop_recovery_handling is opt-in: with the description declaring gpio/local_control (as
+// stop_recovery_handling is opt-in: with the description declaring its gpio state interfaces (as
 // ur.ros2_control.xacro does when the parameter is set), initialization succeeds and it is exported.
 TEST(URHardwareInterfaceExport, ExportsStopRecoveryInterfacesWhenEnabled)
 {
@@ -515,7 +517,8 @@ TEST(URHardwareInterfaceExport, ExportsStopRecoveryInterfacesWhenEnabled)
 
   const auto state_names = GetNames(hardware.export_state_interfaces());
 
-  EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "gpio/local_control"));
+  EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "gpio/remote_control"));
+  EXPECT_THAT(state_names, ::testing::Not(::testing::Contains(std::string(kTfPrefix) + "gpio/local_control")));
 }
 
 // The discriminating case: the hardware parameter is set but the description was not updated to match (a
@@ -605,6 +608,107 @@ TEST(URHardwareInterfaceExport, ConfirmsProgramRestartAcceptsFirstRunWithNothing
   EXPECT_TRUE(TestableHardwareInterface::ConfirmsProgramRestart(
       /*program_was_running_before_resend=*/false, /*program_running_now=*/true,
       /*commandable_now=*/true, seen_program_stop));
+}
+
+// Stands in for the robot: pulled state is commandable, and the dashboard answers is_in_remote_control with
+// the scripted value, so on_activate's outcome depends on the remote-control check alone.
+class RemoteControlHardwareInterface : public ur_robot_driver::URPositionHardwareInterface
+{
+public:
+  using ur_robot_driver::URPositionHardwareInterface::pollRemoteControl;
+  using ur_robot_driver::URPositionHardwareInterface::remote_control_;
+  using ur_robot_driver::URPositionHardwareInterface::updateNonDoubleValues;
+
+  void connectDashboard()
+  {
+    recovery_dashboard_client_ = std::make_unique<urcl::DashboardClient>("127.0.0.1");
+  }
+
+  bool pullRobotState() override
+  {
+    robot_mode_ = static_cast<int32_t>(urcl::RobotMode::RUNNING);
+    safety_mode_ = static_cast<int32_t>(urcl::SafetyMode::NORMAL);
+    runtime_state_ = static_cast<uint32_t>(urcl::rtde_interface::RUNTIME_STATE::PLAYING);
+    robot_program_running_ = true;
+    return true;
+  }
+
+  std::optional<bool> queryRemoteControl() override
+  {
+    ++remote_queries;
+    if (use_real_query) {
+      return URPositionHardwareInterface::queryRemoteControl();
+    }
+    return remote;
+  }
+
+  std::optional<bool> remote;
+  bool use_real_query = false;
+  int remote_queries = 0;
+};
+
+std::unique_ptr<RemoteControlHardwareInterface> MakeRemoteControlHardware()
+{
+  auto hw = std::make_unique<RemoteControlHardwareInterface>();
+  hardware_interface::HardwareComponentInterfaceParams params;
+  params.hardware_info = BuildTestHardwareInfo(/*stop_recovery_handling=*/true);
+  EXPECT_EQ(hw->on_init(params), hardware_interface::CallbackReturn::SUCCESS);
+  hw->connectDashboard();
+  return hw;
+}
+
+TEST(URHardwareInterfaceRemoteControl, ActivateRefusesInLocalControl)
+{
+  auto hw = MakeRemoteControlHardware();
+  hw->remote = false;
+
+  EXPECT_EQ(hw->on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::FAILURE);
+}
+
+// Counterpart to ActivateRefusesInLocalControl: the same commandable robot activates once it is remote.
+TEST(URHardwareInterfaceRemoteControl, ActivateSucceedsInRemoteControl)
+{
+  auto hw = MakeRemoteControlHardware();
+  hw->remote = true;
+
+  EXPECT_EQ(hw->on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::SUCCESS);
+}
+
+// A dashboard that does not answer is a communication fault, not local control and not remote control.
+TEST(URHardwareInterfaceRemoteControl, ActivateReturnsErrorWhenRemoteControlIsUnknown)
+{
+  auto hw = MakeRemoteControlHardware();
+  hw->remote = std::nullopt;
+
+  EXPECT_EQ(hw->on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::ERROR);
+  EXPECT_EQ(hw->remote_queries, 3);
+}
+
+// The real query against a dashboard client that never connected: URCL throws, which must read as unknown.
+TEST(URHardwareInterfaceRemoteControl, ActivateReturnsErrorWhenDashboardIsNotConnected)
+{
+  auto hw = MakeRemoteControlHardware();
+  hw->use_real_query = true;
+
+  EXPECT_EQ(hw->on_activate(rclcpp_lifecycle::State()), hardware_interface::CallbackReturn::ERROR);
+}
+
+TEST(URHardwareInterfaceRemoteControl, PollPublishesRemoteLocalAndUnknown)
+{
+  auto hw = MakeRemoteControlHardware();
+  const auto poll_once = [&](std::optional<bool> remote) {
+    hw->remote = remote;
+    for (int i = 0; i < 100; ++i) {
+      hw->pollRemoteControl();
+    }
+    hw->updateNonDoubleValues();
+    return hw->remote_control_;
+  };
+
+  EXPECT_EQ(poll_once(true), 1.0);
+  EXPECT_EQ(poll_once(false), 0.0);
+  EXPECT_TRUE(std::isnan(poll_once(std::nullopt)));
+  EXPECT_EQ(hw->remote_queries, 3);
 }
 
 int main(int argc, char** argv)

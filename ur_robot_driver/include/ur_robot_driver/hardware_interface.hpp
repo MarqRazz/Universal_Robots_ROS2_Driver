@@ -45,12 +45,14 @@
 // System
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <array>
+#include <atomic>
 
 // ros2_control hardware_interface
 #include "hardware_interface/hardware_info.hpp"
@@ -209,12 +211,14 @@ protected:
   bool ensureRecoveryDashboard();
   // Pulls one RTDE package directly, the way read() does, and fills robot_mode_/safety_mode_/runtime_state_;
   // read() does not run while a lifecycle transition is in progress, so recoverFromStop() cannot wait for it.
-  bool pullRobotState();
-  // Synchronous dashboard query for local/remote control, used by recoverFromStop's own refusal check.
-  bool queryLocalControl();
-  // Low-rate dashboard poll feeding the gpio/local_control state interface, called from the async thread;
-  // RTDE has no field for it. recoverFromStop() uses queryLocalControl() directly instead of this value.
-  void pollLocalControl();
+  virtual bool pullRobotState();
+  // Synchronous dashboard query: true remote, false local, nullopt when the query failed. A robot without
+  // the remote-control concept (CB3, PolyScope before 5.6) reads as remote. Call with
+  // recovery_dashboard_mutex_ held.
+  virtual std::optional<bool> queryRemoteControl();
+  // Low-rate dashboard poll feeding gpio/remote_control, called from the async thread; RTDE has no field
+  // for it. recoverFromStop() queries directly instead of trusting this value.
+  void pollRemoteControl();
   // Latches reason on the stop_reason publisher; a no-op before on_init creates it (e.g. in a unit test with
   // no executor) or when stop_recovery_handling_ is off.
   void publishStopReason(const std::string& reason);
@@ -524,7 +528,7 @@ protected:
   urcl::ControlBoxType control_box_type_ = urcl::ControlBoxType::UNKNOWN;
 
   // Opt-in hardware-contract behaviour: write() -> DEACTIVATE on an uncommandable stop, read() -> ERROR
-  // on an RTDE loss, on_activate recovery (including power-on/brake-release), and the gpio/local_control
+  // on an RTDE loss, on_activate recovery (including power-on/brake-release), and the gpio/remote_control
   // state interface. Off by default, so upstream behaviour (controller_stopper, robot_state_helper) is
   // unchanged.
   bool stop_recovery_handling_{ false };
@@ -533,12 +537,14 @@ protected:
   // survives the loss read() reports, and of the reverse interface, so on_activate can use it before the
   // control program reconnects.
   std::unique_ptr<urcl::DashboardClient> recovery_dashboard_client_;
+  // The async thread's poll and on_activate share the one dashboard socket.
+  std::mutex recovery_dashboard_mutex_;
 
-  // Local/remote control (state only), 1.0 local / 0.0 remote. Filled by pollLocalControl from the async
-  // thread; local_control_ is the value read() publishes, synchronized from the atomic once per cycle.
-  std::atomic<bool> local_control_atomic_{ false };
-  double local_control_;
-  int local_control_poll_counter_{ 0 };
+  // 1.0 remote, 0.0 local, NaN unknown. The atomic is written by the poll and on_activate; read() publishes
+  // remote_control_, copied from it once per cycle.
+  std::atomic<double> remote_control_atomic_{ std::numeric_limits<double>::quiet_NaN() };
+  double remote_control_{ std::numeric_limits<double>::quiet_NaN() };
+  int remote_control_poll_counter_{ 0 };
 
   // Latched (transient_local) so a late subscriber still sees the last reason; created in on_init, so it
   // exists in every lifecycle state, including before the robot is ever connected. Null without an executor

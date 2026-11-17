@@ -44,6 +44,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "ur_client_library/exceptions.h"
@@ -63,6 +64,13 @@ namespace rtde = urcl::rtde_interface;
 
 namespace ur_robot_driver
 {
+namespace
+{
+double remoteControlValue(const std::optional<bool>& remote)
+{
+  return remote ? (*remote ? 1.0 : 0.0) : std::numeric_limits<double>::quiet_NaN();
+}
+}  // namespace
 
 RobotTypeWithSeries robotTypeFromString(const std::string& robot_type_str)
 {
@@ -132,7 +140,8 @@ URPositionHardwareInterface::on_init(const hardware_interface::HardwareComponent
   const auto stop_recovery_it = info_.hardware_parameters.find("stop_recovery_handling");
   stop_recovery_handling_ = stop_recovery_it != info_.hardware_parameters.end() &&
                             (stop_recovery_it->second == "true" || stop_recovery_it->second == "True");
-  local_control_ = 0.0;
+  remote_control_atomic_ = std::numeric_limits<double>::quiet_NaN();
+  remote_control_ = std::numeric_limits<double>::quiet_NaN();
   last_rtde_packet_ = std::chrono::steady_clock::now();
 
   // Created here, not on_configure: this interface exists in every lifecycle state, including before the
@@ -443,7 +452,7 @@ URPositionHardwareInterface::on_export_state_interfaces()
   // Declared in the description only when stop_recovery_handling is set (see ur.ros2_control.xacro),
   // so this mirror is added to match; add_state_mirror would otherwise throw on an undeclared interface.
   if (stop_recovery_handling_) {
-    add_state_mirror(tf_prefix + "gpio", "local_control", &local_control_);
+    add_state_mirror(tf_prefix + "gpio", "remote_control", &remote_control_);
   }
 
   return exported_interfaces;
@@ -967,9 +976,8 @@ URPositionHardwareInterface::on_configure(const rclcpp_lifecycle::State& previou
                                                            urcl::DashboardClient::ClientPolicy::G5;
     recovery_dashboard_client_ = std::make_unique<urcl::DashboardClient>(robot_ip, client_policy);
     if (recovery_dashboard_client_->connect(3, std::chrono::seconds(2))) {
-      // Seeded here, synchronously, rather than left at its default false (remote) until pollLocalControl's
-      // first tick: a state interface read in that window would otherwise report the wrong value.
-      local_control_atomic_ = queryLocalControl();
+      std::lock_guard<std::mutex> dashboard_lock(recovery_dashboard_mutex_);
+      remote_control_atomic_ = remoteControlValue(queryRemoteControl());
     } else {
       RCLCPP_ERROR(rclcpp::get_logger("URPositionHardwareInterface"),
                    "stop_recovery_handling is set, but connecting to the dashboard server at '%s' failed. "
@@ -1108,12 +1116,18 @@ bool URPositionHardwareInterface::pullRobotState()
   return false;
 }
 
-bool URPositionHardwareInterface::queryLocalControl()
+std::optional<bool> URPositionHardwareInterface::queryRemoteControl()
 {
   try {
-    return !recovery_dashboard_client_->commandIsInRemoteControl();
-  } catch (const urcl::UrException&) {
-    return false;  // CB3 has no remote-control concept.
+    auto response = recovery_dashboard_client_->commandIsInRemoteControlWithResponse();
+    if (!response.ok) {
+      return std::nullopt;
+    }
+    return std::get<bool>(response.data["remote_control"]);
+  } catch (const urcl::VersionMismatch&) {
+    return true;
+  } catch (const std::exception&) {
+    return std::nullopt;
   }
 }
 
@@ -1127,6 +1141,7 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::recoverFromStop(
   // margin for the service round trip around this call.
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
   const auto timed_out = [&] { return std::chrono::steady_clock::now() > deadline; };
+  std::lock_guard<std::mutex> dashboard_lock(recovery_dashboard_mutex_);
 
   if (!pullRobotState()) {
     RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: no RTDE data; communication is lost.");
@@ -1143,8 +1158,22 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::recoverFromStop(
     RCLCPP_ERROR(rclcpp::get_logger(logger_name), "Cannot activate: the recovery dashboard connection is unavailable.");
     return hardware_interface::CallbackReturn::ERROR;
   }
-  if (queryLocalControl()) {
-    const std::string reason = "Cannot activate: the robot is in local control.";
+  std::optional<bool> remote;
+  for (int attempt = 0; attempt < 3 && !remote; ++attempt) {
+    if (attempt > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    remote = queryRemoteControl();
+  }
+  remote_control_atomic_ = remoteControlValue(remote);
+  if (!remote) {
+    RCLCPP_ERROR(rclcpp::get_logger(logger_name),
+                 "Cannot activate: the dashboard server did not answer 'is in remote control'.");
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+  if (!*remote) {
+    const std::string reason =
+        "Cannot activate: the robot is in local control. Switch PolyScope to Remote Control on the teach pendant.";
     RCLCPP_ERROR(rclcpp::get_logger(logger_name), "%s", reason.c_str());
     publishStopReason(reason);
     return hardware_interface::CallbackReturn::FAILURE;
@@ -1297,8 +1326,10 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::stop()
   ur_driver_.reset();
 
   if (recovery_dashboard_client_) {
+    std::lock_guard<std::mutex> dashboard_lock(recovery_dashboard_mutex_);
     recovery_dashboard_client_->disconnect();
     recovery_dashboard_client_.reset();
+    remote_control_atomic_ = std::numeric_limits<double>::quiet_NaN();
   }
 
   RCLCPP_INFO(rclcpp::get_logger("URPositionHardwareInterface"), "System successfully stopped!");
@@ -1837,24 +1868,27 @@ void URPositionHardwareInterface::checkAsyncIO()
   }
 
   if (stop_recovery_handling_) {
-    pollLocalControl();
+    pollRemoteControl();
   }
 
   push_command_mirrors(async_command_mirrors_, true);
 }
 
-void URPositionHardwareInterface::pollLocalControl()
+void URPositionHardwareInterface::pollRemoteControl()
 {
   // Every ~2 s (asyncThread calls checkAsyncIO every 20 ms): RTDE has no local/remote field, and polling the
   // dashboard on every cycle would needlessly load its single TCP connection.
-  if (++local_control_poll_counter_ < 100) {
+  if (++remote_control_poll_counter_ < 100) {
     return;
   }
-  local_control_poll_counter_ = 0;
-  if (!ensureRecoveryDashboard()) {
+  remote_control_poll_counter_ = 0;
+  // on_activate holds the connection for seconds and refreshes the value itself.
+  std::unique_lock<std::mutex> dashboard_lock(recovery_dashboard_mutex_, std::try_to_lock);
+  if (!dashboard_lock.owns_lock()) {
     return;
   }
-  local_control_atomic_ = queryLocalControl();
+  remote_control_atomic_ =
+      ensureRecoveryDashboard() ? remoteControlValue(queryRemoteControl()) : std::numeric_limits<double>::quiet_NaN();
 }
 
 void URPositionHardwareInterface::publishStopReason(const std::string& reason)
@@ -1920,7 +1954,7 @@ void URPositionHardwareInterface::updateNonDoubleValues()
   system_interface_initialized_ = initialized_ ? 1.0 : 0.0;
   robot_program_running_copy_ = robot_program_running_ ? 1.0 : 0.0;
   if (stop_recovery_handling_) {
-    local_control_ = local_control_atomic_ ? 1.0 : 0.0;
+    remote_control_ = remote_control_atomic_.load();
   }
 }
 
