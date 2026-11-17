@@ -546,6 +546,9 @@ protected:
   double remote_control_{ std::numeric_limits<double>::quiet_NaN() };
   int remote_control_poll_counter_{ 0 };
 
+  // 1.0 when the robot's calibration matches kinematics/hash, 0.0 when not, NaN before on_configure checks.
+  double calibration_matches_{ std::numeric_limits<double>::quiet_NaN() };
+
   // Latched (transient_local) so a late subscriber still sees the last reason; created in on_init, so it
   // exists in every lifecycle state, including before the robot is ever connected. Null without an executor
   // (get_node() returns null then, e.g. in a unit test), in which case publishStopReason() is a no-op.

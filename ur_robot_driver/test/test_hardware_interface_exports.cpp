@@ -165,6 +165,7 @@ hardware_interface::HardwareInfo BuildTestHardwareInfo(bool stop_recovery_handli
   gpio_states.push_back("program_running");
   if (stop_recovery_handling) {
     gpio_states.push_back("remote_control");
+    gpio_states.push_back("calibration_matches");
   }
   make_gpio("gpio", gpio_cmds, gpio_states);
 
@@ -518,6 +519,7 @@ TEST(URHardwareInterfaceExport, ExportsStopRecoveryInterfacesWhenEnabled)
   const auto state_names = GetNames(hardware.export_state_interfaces());
 
   EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "gpio/remote_control"));
+  EXPECT_THAT(state_names, ::testing::Contains(std::string(kTfPrefix) + "gpio/calibration_matches"));
   EXPECT_THAT(state_names, ::testing::Not(::testing::Contains(std::string(kTfPrefix) + "gpio/local_control")));
 }
 

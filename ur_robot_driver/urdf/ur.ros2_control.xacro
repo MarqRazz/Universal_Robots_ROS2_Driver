@@ -252,9 +252,10 @@
           </xacro:if>
         </state_interface>
 
-        <!-- RTDE has no field for this; the driver polls the dashboard at a low rate instead. -->
+        <!-- Not in RTDE: remote_control is polled from the dashboard, calibration_matches is set in on_configure. -->
         <xacro:if value="${stop_recovery_handling}">
           <state_interface name="remote_control"/>
+          <state_interface name="calibration_matches"/>
         </xacro:if>
       </gpio>
 

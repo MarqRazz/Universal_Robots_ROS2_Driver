@@ -142,6 +142,7 @@ URPositionHardwareInterface::on_init(const hardware_interface::HardwareComponent
                             (stop_recovery_it->second == "true" || stop_recovery_it->second == "True");
   remote_control_atomic_ = std::numeric_limits<double>::quiet_NaN();
   remote_control_ = std::numeric_limits<double>::quiet_NaN();
+  calibration_matches_ = std::numeric_limits<double>::quiet_NaN();
   last_rtde_packet_ = std::chrono::steady_clock::now();
 
   // Created here, not on_configure: this interface exists in every lifecycle state, including before the
@@ -453,6 +454,7 @@ URPositionHardwareInterface::on_export_state_interfaces()
   // so this mirror is added to match; add_state_mirror would otherwise throw on an undeclared interface.
   if (stop_recovery_handling_) {
     add_state_mirror(tf_prefix + "gpio", "remote_control", &remote_control_);
+    add_state_mirror(tf_prefix + "gpio", "calibration_matches", &calibration_matches_);
   }
 
   return exported_interfaces;
@@ -1014,7 +1016,9 @@ URPositionHardwareInterface::on_configure(const rclcpp_lifecycle::State& previou
               calibration_checksum.c_str());
   // check calibration
   // https://github.com/UniversalRobots/Universal_Robots_ROS_Driver/blob/c3378599d5fa73a261328b326392e847f312ab6b/ur_robot_driver/src/hardware_interface.cpp#L296-L309
-  if (ur_driver_->checkCalibration(calibration_checksum)) {
+  const bool calibration_matches = ur_driver_->checkCalibration(calibration_checksum);
+  calibration_matches_ = calibration_matches ? 1.0 : 0.0;
+  if (calibration_matches) {
     RCLCPP_INFO(rclcpp::get_logger("URPositionHardwareInterface"), "Calibration checked successfully.");
   } else {
     RCLCPP_ERROR_STREAM(rclcpp::get_logger("URPositionHardwareInterface"),
