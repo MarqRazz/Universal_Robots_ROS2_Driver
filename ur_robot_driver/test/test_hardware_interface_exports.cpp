@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -732,6 +733,41 @@ TEST(URHardwareInterfaceRemoteControl, PollPublishesRemoteLocalAndUnknown)
   EXPECT_EQ(poll_once(false), 0.0);
   EXPECT_TRUE(std::isnan(poll_once(std::nullopt)));
   EXPECT_EQ(hw->remote_queries, 3);
+}
+
+class RtdeOutageHardwareInterface : public ur_robot_driver::URPositionHardwareInterface
+{
+public:
+  using ur_robot_driver::URPositionHardwareInterface::checkRtdeOutage;
+  using ur_robot_driver::URPositionHardwareInterface::restartRtdeOutageClock;
+
+  void lastPacketAgo(std::chrono::milliseconds age)
+  {
+    last_rtde_packet_ = std::chrono::steady_clock::now() - age;
+  }
+};
+
+TEST(URHardwareInterfaceRtdeOutage, ErrorsOnlyPastOneSecondWithoutAPacket)
+{
+  RtdeOutageHardwareInterface hw;
+
+  hw.lastPacketAgo(std::chrono::milliseconds(500));
+  EXPECT_EQ(hw.checkRtdeOutage(), hardware_interface::return_type::OK);
+
+  hw.lastPacketAgo(std::chrono::milliseconds(1500));
+  EXPECT_EQ(hw.checkRtdeOutage(), hardware_interface::return_type::ERROR);
+}
+
+// The last packet before a disconnect is long past by the time on_configure reconnects; restarting the clock
+// there keeps read() from erroring the freshly configured component before its first packet arrives.
+TEST(URHardwareInterfaceRtdeOutage, RestartingTheClockClearsAStaleOutage)
+{
+  RtdeOutageHardwareInterface hw;
+  hw.lastPacketAgo(std::chrono::seconds(30));
+
+  hw.restartRtdeOutageClock();
+
+  EXPECT_EQ(hw.checkRtdeOutage(), hardware_interface::return_type::OK);
 }
 
 int main(int argc, char** argv)

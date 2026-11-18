@@ -1077,6 +1077,8 @@ URPositionHardwareInterface::on_configure(const rclcpp_lifecycle::State& previou
   ur_driver_->registerToolContactResultCallback(
       std::bind(&URPositionHardwareInterface::tool_contact_callback, this, std::placeholders::_1));
 
+  // The clock still holds the last packet before a disconnect, which read() would count as a fresh outage.
+  restartRtdeOutageClock();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -1308,8 +1310,8 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::recoverFromStop(
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
-  // Seeds read()'s outage watchdog from this known-good moment, not on_configure's connect.
-  last_rtde_packet_ = std::chrono::steady_clock::now();
+  // on_activate can hold the transition for seconds, during which read() sees no packets.
+  restartRtdeOutageClock();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -1532,20 +1534,29 @@ hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::
     RCLCPP_ERROR(rclcpp::get_logger("URPositionHardwareInterface"), "Unable to read from hardware...");
   // States can also change outside of read(), e.g. in write() or in callbacks.
   push_state_mirrors();
-  if (stop_recovery_handling_) {
-    // Bounded outage, not an immediate ERROR on one missed cycle: non_blocking_read_ has no other signal,
-    // since an empty poll is the normal case there, and even a blocking read can miss one cycle under load.
-    const auto outage = std::chrono::steady_clock::now() - last_rtde_packet_;
-    if (outage > std::chrono::milliseconds(1000)) {
-      RCLCPP_ERROR(rclcpp::get_logger("URPositionHardwareInterface"),
-                   "No RTDE data for over 1 s; reporting ERROR so on_error resets the connection.");
-      return hardware_interface::return_type::ERROR;
-    }
-    if (++rtde_outage_warn_counter_ % 250 == 0) {
-      RCLCPP_WARN(rclcpp::get_logger("URPositionHardwareInterface"), "No RTDE packet this cycle.");
-    }
+  return stop_recovery_handling_ ? checkRtdeOutage() : hardware_interface::return_type::OK;
+}
+
+hardware_interface::return_type URPositionHardwareInterface::checkRtdeOutage()
+{
+  // Bounded outage, not an immediate ERROR on one missed cycle: non_blocking_read_ has no other signal,
+  // since an empty poll is the normal case there, and even a blocking read can miss one cycle under load.
+  const auto outage = std::chrono::steady_clock::now() - last_rtde_packet_;
+  if (outage > std::chrono::milliseconds(1000)) {
+    RCLCPP_ERROR(rclcpp::get_logger("URPositionHardwareInterface"),
+                 "No RTDE data for over 1 s; reporting ERROR so on_error resets the connection.");
+    return hardware_interface::return_type::ERROR;
+  }
+  if (++rtde_outage_warn_counter_ % 250 == 0) {
+    RCLCPP_WARN(rclcpp::get_logger("URPositionHardwareInterface"), "No RTDE packet this cycle.");
   }
   return hardware_interface::return_type::OK;
+}
+
+void URPositionHardwareInterface::restartRtdeOutageClock()
+{
+  last_rtde_packet_ = std::chrono::steady_clock::now();
+  rtde_outage_warn_counter_ = 0;
 }
 
 hardware_interface::return_type URPositionHardwareInterface::write(const rclcpp::Time& time,

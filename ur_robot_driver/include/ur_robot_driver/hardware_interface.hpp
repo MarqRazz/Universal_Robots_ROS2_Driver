@@ -218,6 +218,10 @@ protected:
   // the remote-control concept (CB3, PolyScope before 5.6) reads as remote. Call with
   // recovery_dashboard_mutex_ held.
   virtual std::optional<bool> queryRemoteControl();
+  // read()'s no-packet branch: ERROR once no RTDE packet has arrived for over 1 s, else OK.
+  hardware_interface::return_type checkRtdeOutage();
+  // Starts read()'s outage clock afresh; on_configure calls it once connected, on_activate once commandable.
+  void restartRtdeOutageClock();
   // Low-rate dashboard poll feeding gpio/remote_control, called from the async thread; RTDE has no field
   // for it. recoverFromStop() queries directly instead of trusting this value.
   void pollRemoteControl();
@@ -559,8 +563,7 @@ protected:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr stop_reason_pub_;
 
   // read()'s RTDE outage watchdog: the last cycle a packet actually arrived, and a throttle counter for the
-  // warning logged on every cycle until read() reports ERROR past the bound. on_activate seeds this once
-  // commandable, so the outage clock starts counting from a known-good moment, not on_configure's connect.
+  // warning logged on every cycle until read() reports ERROR past the bound.
   std::chrono::steady_clock::time_point last_rtde_packet_;
   int rtde_outage_warn_counter_{ 0 };
 };
