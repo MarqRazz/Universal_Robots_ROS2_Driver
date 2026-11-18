@@ -643,6 +643,21 @@ public:
   using ur_robot_driver::URPositionHardwareInterface::remote_control_;
   using ur_robot_driver::URPositionHardwareInterface::updateNonDoubleValues;
 
+  // Commandable state with write()'s command branch skipped, which needs a connected driver.
+  void makeCommandableWithoutCommanding()
+  {
+    pullRobotState();
+    non_blocking_read_ = true;
+    packet_read_ = false;
+  }
+
+  void pollUntilQueried()
+  {
+    for (int i = 0; i < 100; ++i) {
+      pollRemoteControl();
+    }
+  }
+
   void connectDashboard()
   {
     recovery_dashboard_client_ = std::make_unique<urcl::DashboardClient>("127.0.0.1");
@@ -733,6 +748,34 @@ TEST(URHardwareInterfaceRemoteControl, PollPublishesRemoteLocalAndUnknown)
   EXPECT_EQ(poll_once(false), 0.0);
   EXPECT_TRUE(std::isnan(poll_once(std::nullopt)));
   EXPECT_EQ(hw->remote_queries, 3);
+}
+
+// Local control leaves the program running, so isCommandable() stays true and only remote_control can
+// take the component out of ACTIVE. Fails pre-fix: write() returned OK in Local control.
+TEST(URHardwareInterfaceRemoteControl, WriteDeactivatesInLocalControl)
+{
+  auto hw = MakeRemoteControlHardware();
+  hw->makeCommandableWithoutCommanding();
+  hw->remote = false;
+  hw->pollUntilQueried();
+
+  EXPECT_EQ(hw->write(rclcpp::Time(), rclcpp::Duration(0, 0)), hardware_interface::return_type::DEACTIVATE);
+}
+
+// A single failed dashboard poll (NaN) must not stop a commandable arm; Remote control keeps it ACTIVE.
+TEST(URHardwareInterfaceRemoteControl, WriteStaysActiveInRemoteControlOrAfterAFailedPoll)
+{
+  auto hw = MakeRemoteControlHardware();
+  hw->makeCommandableWithoutCommanding();
+
+  hw->remote = std::nullopt;
+  hw->pollUntilQueried();
+  EXPECT_EQ(hw->write(rclcpp::Time(), rclcpp::Duration(0, 0)), hardware_interface::return_type::OK);
+
+  hw->remote = true;
+  hw->pollUntilQueried();
+  EXPECT_EQ(hw->write(rclcpp::Time(), rclcpp::Duration(0, 0)), hardware_interface::return_type::OK);
+  EXPECT_EQ(hw->remote_queries, 2);
 }
 
 class RtdeOutageHardwareInterface : public ur_robot_driver::URPositionHardwareInterface

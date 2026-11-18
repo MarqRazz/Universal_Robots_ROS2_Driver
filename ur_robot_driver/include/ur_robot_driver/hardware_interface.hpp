@@ -533,10 +533,10 @@ protected:
 
   urcl::ControlBoxType control_box_type_ = urcl::ControlBoxType::UNKNOWN;
 
-  // Opt-in hardware-contract behaviour: write() -> DEACTIVATE on an uncommandable stop, read() -> ERROR
-  // on an RTDE loss, on_activate recovery (including power-on/brake-release), and the gpio/remote_control
-  // state interface. Off by default, so upstream behaviour (controller_stopper, robot_state_helper) is
-  // unchanged.
+  // Opt-in hardware-contract behaviour: write() -> DEACTIVATE on an uncommandable stop or in Local control,
+  // read() -> ERROR on an RTDE loss, on_activate recovery (including power-on/brake-release), and the
+  // gpio/remote_control state interface. Off by default, so upstream behaviour (controller_stopper,
+  // robot_state_helper) is unchanged.
   bool stop_recovery_handling_{ false };
 
   // Dashboard connection used only for recovery and the local-control poll. Independent of RTDE, so it

@@ -1578,7 +1578,8 @@ hardware_interface::return_type URPositionHardwareInterface::write(const rclcpp:
   // stop_recovery_handling_ replaces this cycle's silent no-op with DEACTIVATE: the component leaves
   // ACTIVE instead of quietly pausing, so a stop always goes through on_activate's recovery rather than the
   // robot resuming whatever it was doing on its own (the motion rule the stock driver leaves unenforced).
-  if (stop_recovery_handling_ && !isCommandable()) {
+  // Local control leaves ACTIVE too, since the program keeps running there; NaN is a failed poll, not Local.
+  if (stop_recovery_handling_ && (!isCommandable() || remote_control_atomic_.load() == 0.0)) {
     push_command_mirrors(command_mirrors_, false);
     return hardware_interface::return_type::DEACTIVATE;
   }
