@@ -1169,10 +1169,8 @@ hardware_interface::CallbackReturn URPositionHardwareInterface::recoverFromStop(
 {
   const auto* logger_name = "URPositionHardwareInterface";
 
-  // One shared deadline for the whole function, not one per phase: amp_device_node's recover() has a single
-  // request_timeout_s (10 s) budget for the whole activation, so a per-phase timeout that each independently
-  // waited its own worst case could add up past that regardless of any single phase's own limit. 7 s leaves
-  // margin for the service round trip around this call.
+  // One deadline for the whole activation, not one per phase: callers give on_activate a single bounded
+  // budget, which per-phase timeouts could add up past.
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
   const auto timed_out = [&] { return std::chrono::steady_clock::now() > deadline; };
   std::lock_guard<std::mutex> dashboard_lock(recovery_dashboard_mutex_);
