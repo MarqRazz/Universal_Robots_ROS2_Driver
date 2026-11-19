@@ -196,23 +196,17 @@ protected:
   // True when the robot will execute a command this cycle: program running, runtime PLAYING, safety_mode
   // normal or reduced. Only consulted when stop_recovery_handling_ is set.
   bool isCommandable() const;
-  // After resending the program, robot_program_running_/runtime_state_ can still read as the old program's
-  // (set before the resend); accepting "commandable" from that stale pair exits before the new program is
-  // actually the one running. Call once per fresh pullRobotState() after sendRobotProgram(): seen_program_stop
-  // starts at !program_was_running_before_resend and latches true the first time program_running_now is
-  // false, so a from-fresh "commandable" only counts once the old program's end has actually been observed
-  // (or there was no old program to confuse it with).
+  // True when commandable after a program resend, but only once a previously running program has been seen to
+  // stop; seen_program_stop latches that across calls.
   static bool ConfirmsProgramRestart(bool program_was_running_before_resend, bool program_running_now,
                                      bool commandable_now, bool& seen_program_stop);
   // The dashboard's serial number as a double, or NaN unless it is all digits and at most 2^53 (exact in a double).
   static double SerialNumberValue(const std::string& serial_number);
-  // Powers on, releases the brakes, unlocks a protective stop or restarts safety, and resends the control
-  // program, re-reading state between each step; FAILURE needs an operator, ERROR is a genuine comms loss.
+  // Brings the robot from a stop to commandable; FAILURE needs an operator, ERROR is a communication loss.
   hardware_interface::CallbackReturn recoverFromStop();
   // True once recovery_dashboard_client_ exists. Does not itself (re)connect.
   bool ensureRecoveryDashboard();
-  // Pulls one RTDE package directly, the way read() does, and fills robot_mode_/safety_mode_/runtime_state_;
-  // read() does not run while a lifecycle transition is in progress, so recoverFromStop() cannot wait for it.
+  // Reads one RTDE package directly, since read() does not run during a lifecycle transition.
   virtual bool pullRobotState();
   // Synchronous dashboard query: true remote, false local, nullopt when the query failed. A robot without
   // the remote-control concept (CB3, PolyScope before 5.6) reads as remote. Call with
@@ -222,8 +216,7 @@ protected:
   hardware_interface::return_type checkRtdeOutage();
   // Starts read()'s outage clock afresh; on_configure calls it once connected, on_activate once commandable.
   void restartRtdeOutageClock();
-  // Low-rate dashboard poll feeding gpio/remote_control, called from the async thread; RTDE has no field
-  // for it. recoverFromStop() queries directly instead of trusting this value.
+  // Low-rate dashboard poll feeding gpio/remote_control, called from the async thread.
   void pollRemoteControl();
   // Latches reason on the stop_reason publisher; a no-op before on_init creates it (e.g. in a unit test with
   // no executor) or when stop_recovery_handling_ is off.
